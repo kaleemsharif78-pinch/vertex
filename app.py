@@ -102,12 +102,24 @@ def _init_schema():
                 username TEXT UNIQUE, password_hash TEXT, role TEXT,
                 full_name TEXT, created_at TEXT)"""))
 
-        insp = inspect(engine)
-        inv_cols = [c["name"] for c in insp.get_columns("inventory")]
-        for col in ["entry_date", "remark", "company_token", "contract_no", "style_type"]:
-            if col not in inv_cols:
-                conn.execute(text(f"ALTER TABLE inventory ADD COLUMN {col} TEXT DEFAULT ''"))
+        #  نیا فکس کوڈ (ٹیبلز بنانے کے فوراً بعد کنکشن کو ریفریش کرنا)
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS app_users (
+                id {pk},
+                username TEXT UNIQUE, password_hash TEXT, role TEXT,
+                full_name TEXT, created_at TEXT)"""))
+        
+        # کنکشن کو فوراً کمیٹ کریں تاکہ کلاؤڈ پر ٹیبلز پکے ہو جائیں
+        conn.commit()
 
+    # 'with' بلاک سے باہر آ کر بالکل نیا انسپکٹر بنانا تاکہ کلاؤڈ ریفریش ہو جائے
+    insp = inspect(engine)
+    if engine.dialect.has_table(engine.connect(), "inventory"):
+        inv_cols = [c["name"] for c in insp.get_columns("inventory")]
+        with engine.begin() as conn:
+            for col in ["entry_date", "remark", "company_token", "contract_no", "style_type"]:
+                if col not in inv_cols:
+                    conn.execute(text(f"ALTER TABLE inventory ADD COLUMN {col} TEXT DEFAULT ''"))
         # Indexes. MySQL has no "CREATE INDEX IF NOT EXISTS", so each is
         # wrapped individually — a "duplicate index" error is caught and
         # ignored on any dialect.
