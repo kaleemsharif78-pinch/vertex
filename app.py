@@ -17,7 +17,7 @@ from sqlalchemy import create_engine, text, inspect
 # DATABASE SYSTEM — CLOUD (PostgreSQL / MySQL via SQLAlchemy)
 # ═══════════════════════════════════════════════
 # Set your connection string in .streamlit/secrets.toml as:
-#   DB_URL = "postgresql+psycopg2://user:password@host:5432/dbname"
+#   DB_URL = "postgresql+psycopg2://user:password@host:6543/dbname"
 #   -- or --
 #   DB_URL = "mysql+pymysql://user:password@host:3306/dbname"
 # (For local dry-testing only, "sqlite:///textile_inventory.db" also works.)
@@ -33,7 +33,7 @@ def _get_engine():
     db_url = st.secrets.get("DB_URL")
     if not db_url:
         st.error("⚠️ DB_URL is not configured in `.streamlit/secrets.toml`. "
-                 "Add e.g. DB_URL = \"postgresql+psycopg2://user:pass@host:5432/dbname\" and restart.")
+                 "Add e.g. DB_URL = \"postgresql+psycopg2://user:pass@host:6543/dbname\" and restart.")
         st.stop()
     return create_engine(db_url, pool_pre_ping=True)
 
