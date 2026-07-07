@@ -379,7 +379,11 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .stApp{background-color:#1a202c !important;color:#e2e8f0 !important;}
-.hdr{background:linear-gradient(135deg,#0f172a,#1e293b);padding:20px 30px;border-radius:12px;
+st.markdown("""
+    <style>
+    .hdr{background:linear-gradient(135deg,#0f172a,#1e293b);padding:20px 30px;border-radius:12px;}
+    </style>
+""", unsafe_allow_html=True)
      margin-bottom:20px;border-left:6px solid #38bdf8;box-shadow:0 4px 6px rgba(0,0,0,.2);}
 .hdr h1{color:#f8fafc;font-size:1.6rem;font-weight:700;margin:0;}
 .hdr .cl{color:#f59e0b;font-size:.88rem;font-weight:600;margin:4px 0 0;}
