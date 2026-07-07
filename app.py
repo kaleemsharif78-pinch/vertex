@@ -185,18 +185,20 @@ STYLES_INLAY = ["Normal", "Topper", "Split"]
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
+# 🔄 اس فنکشن کو اپڈیٹ کرنا ہے (لائن 187 کے پاس)
 def q(sql, params=None):
     named_sql, pdict = _qmark_to_named(sql, params or [])
     engine = _get_engine()
-    with engine.connect() as conn:
-        df = pd.read_sql(text(named_sql), conn, params=pdict)
-    return df
-
-def scalar(sql, params=None):
-    conn = get_conn()
-    r = conn.execute(sql, params or []).fetchone()
-    conn.close()
-    return (r[0] or 0) if r else 0
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(text(named_sql), conn, params=pdict)
+        return df
+    except Exception as e:
+        # اگر ٹیبل نہ ملنے کا ایرر آئے، تو زبردستی اسکیما انیشلائز کروائیں
+        _init_schema()
+        with engine.connect() as conn:
+            df = pd.read_sql(text(named_sql), conn, params=pdict)
+        return df
 
 def get_calloff_list():
     return q("SELECT DISTINCT call_off_no FROM sheet_orders WHERE TRIM(call_off_no)!='' ORDER BY call_off_no")["call_off_no"].tolist()
