@@ -379,7 +379,7 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 html,body,[class*="css"]{font-family:'Inter',sans-serif;}
 .stApp{background-color:#1a202c !important;color:#e2e8f0 !important;}
-st.markdown("""
+st.markdown(""")
     <style>
     .hdr{background:linear-gradient(135deg,#0f172a,#1e293b);padding:20px 30px;border-radius:12px;}
     </style>
