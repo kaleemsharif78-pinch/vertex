@@ -97,20 +97,19 @@ def _init_schema():
                 bilty_date TEXT, created_at TEXT)"""))
         # NEW: multi-user login + role-based access control
         conn.execute(text(f"""
-            CREATE TABLE IF NOT EXISTS app_users (
-                id {pk},
-                username TEXT UNIQUE, password_hash TEXT, role TEXT,
-                full_name TEXT, created_at TEXT)"""))
+            # 🔄 ڈویلپر کے لیے فکس کوڈ:
+# جب app_users ٹیبل بن جائے، تو چیک کریں کہ کیا وہ خالی ہے؟ اگر خالی ہے تو ڈیفالٹ ایڈمن ڈال دیں۔
 
-        #  نیا فکس کوڈ (ٹیبلز بنانے کے فوراً بعد کنکشن کو ریفریش کرنا)
-        conn.execute(text(f"""
-            CREATE TABLE IF NOT EXISTS app_users (
-                id {pk},
-                username TEXT UNIQUE, password_hash TEXT, role TEXT,
-                full_name TEXT, created_at TEXT)"""))
-        
-        # کنکشن کو فوراً کمیٹ کریں تاکہ کلاؤڈ پر ٹیبلز پکے ہو جائیں
-        conn.commit()
+# یہ کوڈ '_init_schema()' میں ٹیبل بنانے کے فوراً بعد آئے گا:
+user_check = conn.execute(text("SELECT COUNT(*) FROM app_users")).fetchone()
+if user_check and user_check[0] == 0:
+    # یہاں 'admin123' کا ہیش (Hash) یا پلین ٹیکسٹ (جیسا آپ کا سسٹم سپورٹ کرتا ہے) انسرٹ کرنا ہے
+    # اگر آپ کا سسٹم پلین ٹیکسٹ پاس ورڈ لیتا ہے، تو نیچے 'admin123' لکھیں، اگر ہیش لیتا ہے تو ہیشڈ پاس ورڈ ڈالیں
+    conn.execute(text("""
+        INSERT INTO app_users (username, password_hash, role, full_name, created_at)
+        VALUES ('admin', 'admin123', 'admin', 'System Administrator', NOW())
+    """))
+    conn.commit()
 
     # 'with' بلاک سے باہر آ کر بالکل نیا انسپکٹر بنانا تاکہ کلاؤڈ ریفریش ہو جائے
     insp = inspect(engine)
