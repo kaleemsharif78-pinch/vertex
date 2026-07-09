@@ -1141,9 +1141,9 @@ with tab4:
             # 🆕 NEW ADDITION: CONTRACT-WISE SHORTFALL SUMMARY
             # ═══════════════════════════════════════════════
             
-            st.markdown("---")
-                st.markdown("### 📌 CONTRACT-WISE SHORTFALL SUMMARY")
-            st.info("💡 نیچے ہر سیلز کنٹریکٹ کے حساب سے الگ الگ بقایا (Shortfall) بریک ڈاؤن دکھایا گیا ہے:")
+        st.markdown("---")
+        st.markdown("### 📌 CONTRACT-WISE SHORTFALL SUMMARY")
+        st.info("💡 نیچے ہر سیلز کنٹریکٹ کے حساب سے الگ الگ بقایا (Shortfall) بریک ڈاؤن دکھایا گیا ہے:")
         
             # گوبل لیجر سے اس کال آف کے تمام یونیک کنٹریکٹس نکالیں
             unique_contracts_in_ledger = sorted(df_ledger["Contract #"].unique().tolist())
