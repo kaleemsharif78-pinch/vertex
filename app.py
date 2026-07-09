@@ -1044,7 +1044,8 @@ with tab4:
             # ═══════════════════════════════════════════════
             # 🆕 NEW ADDITION: CONTRACT-WISE SHORTFALL SUMMARY
             # ═══════════════════════════════════════════════
-            st.markdown("---")
+            
+        st.markdown("---")
             st.markdown("### 📌 CONTRACT-WISE SHORTFALL SUMMARY")
             st.info("💡 نیچے ہر سیلز کنٹریکٹ کے حساب سے الگ الگ بقایا (Shortfall) بریک ڈاؤن دکھایا گیا ہے:")
         
