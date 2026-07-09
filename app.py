@@ -1008,58 +1008,38 @@ with tab4:
         st.markdown("##### 🛠️ Dynamic Ledger Filters")
         fl_cols = st.columns(5)
         
-            with fl_cols[0]:
-                l_opt_coff = ["All"] + sorted(df_ledger_raw["Call-Off No"].unique().tolist())
-                l_sel_coff = st.selectbox("Ledger Call-Off", l_opt_coff, key="l_coff")
-            with fl_cols[1]:
-                l_opt_cont = ["All"] + sorted(df_ledger_raw["Contract #"].unique().tolist())
-                l_sel_cont = st.selectbox("Ledger Contract", l_opt_cont, key="l_cont")
-            with fl_cols[2]:
-                l_opt_br = ["All"] + sorted(df_ledger_raw["Brand"].unique().tolist())
-                l_sel_br = st.selectbox("Ledger Brand", l_opt_br, key="l_brand")
-            with fl_cols[3]:
-                l_opt_art = ["All"] + sorted(df_ledger_raw["Article"].unique().tolist())
-                l_sel_art = st.selectbox("Ledger Article", l_opt_art, key="l_art")
-            with fl_cols[4]:
-                l_opt_cat = ["All"] + sorted(df_ledger_raw["Item Type"].unique().tolist())
-                l_sel_cat = st.selectbox("Ledger Item Type", l_opt_cat, key="l_cat")
+        with fl_cols[0]:
+            l_opt_coff = ["All"] + sorted(df_ledger_raw["Call-Off No"].unique().tolist())
+            l_sel_coff = st.selectbox("Ledger Call-Off", l_opt_coff, key="l_coff")
+        with fl_cols[1]:
+            l_opt_cont = ["All"] + sorted(df_ledger_raw["Contract #"].unique().tolist())
+            l_sel_cont = st.selectbox("Ledger Contract", l_opt_cont, key="l_cont")
+        with fl_cols[2]:
+            l_opt_br = ["All"] + sorted(df_ledger_raw["Brand"].unique().tolist())
+            l_sel_br = st.selectbox("Ledger Brand", l_opt_br, key="l_brand")
+        with fl_cols[3]:
+            l_opt_art = ["All"] + sorted(df_ledger_raw["Article"].unique().tolist())
+            l_sel_art = st.selectbox("Ledger Article", l_opt_art, key="l_art")
+        with fl_cols[4]:
+            l_opt_cat = ["All"] + sorted(df_ledger_raw["Item Type"].unique().tolist())
+            l_sel_cat = st.selectbox("Ledger Item Type", l_opt_cat, key="l_cat")
 
-            df_ledger = df_ledger_raw.copy()
-            if l_sel_coff != "All": df_ledger = df_ledger[df_ledger["Call-Off No"] == l_sel_coff]
-            if l_sel_cont != "All": df_ledger = df_ledger[df_ledger["Contract #"] == l_sel_cont]
-            if l_sel_br != "All":   df_ledger = df_ledger[df_ledger["Brand"] == l_sel_br]
-            if l_sel_art != "All":  df_ledger = df_ledger[df_ledger["Article"] == l_sel_art]
-            if l_sel_cat != "All":  df_ledger = df_ledger[df_ledger["Item Type"] == l_sel_cat]
+        df_ledger = df_ledger_raw.copy()
+        if l_sel_coff != "All": df_ledger = df_ledger[df_ledger["Call-Off No"] == l_sel_coff]
+        if l_sel_cont != "All": df_ledger = df_ledger[df_ledger["Contract #"] == l_sel_cont]
+        if l_sel_br != "All":   df_ledger = df_ledger[df_ledger["Brand"] == l_sel_br]
+        if l_sel_art != "All":  df_ledger = df_ledger[df_ledger["Article"] == l_sel_art]
+        if l_sel_cat != "All":  df_ledger = df_ledger[df_ledger["Item Type"] == l_sel_cat]
 
-            tot_o = df_ledger["Total Ordered"].sum()
-            tot_r = df_ledger["Total Received"].sum()
-            tot_b = df_ledger["Remaining Balance"].sum()
+        tot_o = df_ledger["Total Ordered"].sum()
+        tot_r = df_ledger["Total Received"].sum()
+        tot_b = df_ledger["Remaining Balance"].sum()
 
-            st.markdown(f"""<div class="kpi-row">
-              <div class="kpi kb">📦 Filtered Ordered: {round_and_format(tot_o)}</div>
-              <div class="kpi kg">✅ Filtered Received: {round_and_format(tot_r)}</div>
-              <div class="kpi {'kr' if tot_b<0 else 'ka'}">⚖️ Filtered Balance: {round_and_format(tot_b)}</div>
-            </div>""", unsafe_allow_html=True)
-
-            st.markdown("##### 🏷️ Item-Wise Remaining Status (Filtered Global Summary)")
-            item_summary = df_ledger.groupby("Item Type")["Remaining Balance"].sum().to_dict()
-        
-            color_classes = {
-                "Inlay Card / Bandrolle": "kb",
-                "Tag Card / Barcode Sticker": "kg",
-                "Barcode Item": "kr",
-                "Safety": "ka",
-                "Washing Paper": "kp",
-                "Transparent Sticker": "ke",
-                "Eco Friendly": "kb"
-            }
-        
-            item_cols = st.columns(3)
-            for idx, it_name in enumerate(ITEM_TYPES):
-                rem_val = item_summary.get(it_name, 0)
-                cls = color_classes.get(it_name, "kb")
-                with item_cols[idx % 3]:
-                    st.markdown(f'<div class="kpi {cls}" style="margin-bottom: 6px;">⏳ Rem. {it_name}<br><b>{round_and_format(rem_val)}</b> Pcs</div>', unsafe_allow_html=True)
+        st.markdown(f"""<div class="kpi-row">
+          <div class="kpi kb">Filtered Ordered: {round_and_format(tot_o)}</div>
+          <div class="kpi kg">Filtered Received: {round_and_format(tot_r)}</div>
+          <div class="kpi {'kr' if tot_b<0 else 'ka'}">Filtered Balance: {round_and_format(tot_b)}</div>
+        </div>""", unsafe_allow_html=True)
 
             # ═══════════════════════════════════════════════
             # 🆕 NEW ADDITION: CONTRACT-WISE SHORTFALL SUMMARY
