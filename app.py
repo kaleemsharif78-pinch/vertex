@@ -974,30 +974,34 @@ with tab4:
     if _access_ok("📊 Master Ledger"):
         st.markdown('<div class="sec">📊 Master Ledger (Order vs Delivery Status)</div>', unsafe_allow_html=True)
 
-        conn = get_conn()
-        df_ledger_raw = pd.read_sql("""
-            SELECT
-                so.call_off_no        AS "Call-Off No",
-                so.sale_contract      AS "Contract #",
-                so.brand              AS "Brand",
-                so.article            AS "Article",
-                so.category           AS "Item Type",
-                SUM(so.order_qty)     AS "Total Ordered",
-                COALESCE(inv.total_received, 0)                        AS "Total Received",
-                SUM(so.order_qty) - COALESCE(inv.total_received, 0)   AS "Remaining Balance"
-            FROM sheet_orders so
-            LEFT JOIN (
-                SELECT call_off_no, article, category, SUM(qty) AS total_received
-                FROM inventory
-                GROUP BY call_off_no, article, category
-            ) inv ON so.call_off_no = inv.call_off_no
-                  AND so.article    = inv.article
-                  AND so.category   = inv.category
-            GROUP BY so.call_off_no, so.sale_contract, so.brand, so.article, so.category
-            ORDER BY so.call_off_no DESC, so.article ASC
-        """, conn)
-        conn.close()
-
+        # FIX: Using direct sqlite3 connection execution instead of passing connection object directly to read_sql to avoid Python 3.14 lifecycle breakdown
+    import sqlite3
+    db_connection = sqlite3.connect(DB_PATH)
+    
+    query_ledger = """
+        SELECT
+            so.call_off_no        AS "Call-Off No",
+            so.sale_contract      AS "Contract #",
+            so.brand              AS "Brand",
+            so.article            AS "Article",
+            so.category           AS "Item Type",
+            SUM(so.order_qty)     AS "Total Ordered",
+            COALESCE(inv.total_received, 0)                        AS "Total Received",
+            SUM(so.order_qty) - COALESCE(inv.total_received, 0)   AS "Remaining Balance"
+        FROM sheet_orders so
+        LEFT JOIN (
+            SELECT call_off_no, article, category, SUM(qty) AS total_received
+            FROM inventory
+            GROUP BY call_off_no, article, category
+        ) inv ON so.call_off_no = inv.call_off_no
+              AND so.article    = inv.article
+              AND so.category   = inv.category
+        GROUP BY so.call_off_no, so.sale_contract, so.brand, so.article, so.category
+        ORDER BY so.call_off_no DESC, so.article ASC
+    """
+    
+    df_ledger_raw = pd.read_sql_query(query_ledger, db_connection)
+    db_connection.close()
         if df_ledger_raw.empty:
             st.info("Master Ledger is empty. Upload a contract sheet in Tab 5 first.")
         else:
