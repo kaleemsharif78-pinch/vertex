@@ -971,75 +971,171 @@ with tab3:
 # TAB 4 — MASTER LEDGER
 # ═══════════════════════════════════════════════
 with tab4:
-    st.markdown('<div class="sec">📊 Master Ledger (Order vs Delivery Status)</div>', unsafe_allow_html=True)
+    if _access_ok("📊 Master Ledger"):
+        st.markdown('<div class="sec">📊 Master Ledger (Order vs Delivery Status)</div>', unsafe_allow_html=True)
 
-    # FIX: Using direct sqlite3 connection execution with proper matching indentation
-    import sqlite3
-    db_connection = sqlite3.connect(DB_PATH)
-    
-    query_ledger = """
-        SELECT
-            so.call_off_no        AS "Call-Off No",
-            so.sale_contract      AS "Contract #",
-            so.brand              AS "Brand",
-            so.article            AS "Article",
-            so.category           AS "Item Type",
-            SUM(so.order_qty)     AS "Total Ordered",
-            COALESCE(inv.total_received, 0)                        AS "Total Received",
-            SUM(so.order_qty) - COALESCE(inv.total_received, 0)   AS "Remaining Balance"
-        FROM sheet_orders so
-        LEFT JOIN (
-            SELECT call_off_no, article, category, SUM(qty) AS total_received
-            FROM inventory
-            GROUP BY call_off_no, article, category
-        ) inv ON so.call_off_no = inv.call_off_no
-              AND so.article    = inv.article
-              AND so.category   = inv.category
-        GROUP BY so.call_off_no, so.sale_contract, so.brand, so.article, so.category
-        ORDER BY so.call_off_no DESC, so.article ASC
-    """
-    
-    df_ledger_raw = pd.read_sql_query(query_ledger, db_connection)
-    db_connection.close()
-
-    if df_ledger_raw.empty:
-        st.info("Master Ledger is empty. Upload a contract sheet in Tab 5 first.")
-    else:
-        st.markdown("##### 🛠️ Dynamic Ledger Filters")
-        fl_cols = st.columns(5)
+        query_ledger = """
+            SELECT
+                so.call_off_no        AS "Call-Off No",
+                so.sale_contract      AS "Contract #",
+                so.brand              AS "Brand",
+                so.article            AS "Article",
+                so.category           AS "Item Type",
+                SUM(so.order_qty)     AS "Total Ordered",
+                COALESCE(inv.total_received, 0)                        AS "Total Received",
+                SUM(so.order_qty) - COALESCE(inv.total_received, 0)   AS "Remaining Balance"
+            FROM sheet_orders so
+            LEFT JOIN (
+                SELECT call_off_no, article, category, SUM(qty) AS total_received
+                FROM inventory
+                GROUP BY call_off_no, article, category
+            ) inv ON so.call_off_no = inv.call_off_no
+                  AND so.article    = inv.article
+                  AND so.category   = inv.category
+            GROUP BY so.call_off_no, so.sale_contract, so.brand, so.article, so.category
+            ORDER BY so.call_off_no DESC, so.article ASC
+        """
         
-        with fl_cols[0]:
-            l_opt_coff = ["All"] + sorted(df_ledger_raw["Call-Off No"].unique().tolist())
-            l_sel_coff = st.selectbox("Ledger Call-Off", l_opt_coff, key="l_coff")
-        with fl_cols[1]:
-            l_opt_cont = ["All"] + sorted(df_ledger_raw["Contract #"].unique().tolist())
-            l_sel_cont = st.selectbox("Ledger Contract", l_opt_cont, key="l_cont")
-        with fl_cols[2]:
-            l_opt_br = ["All"] + sorted(df_ledger_raw["Brand"].unique().tolist())
-            l_sel_br = st.selectbox("Ledger Brand", l_opt_br, key="l_brand")
-        with fl_cols[3]:
-            l_opt_art = ["All"] + sorted(df_ledger_raw["Article"].unique().tolist())
-            l_sel_art = st.selectbox("Ledger Article", l_opt_art, key="l_art")
-        with fl_cols[4]:
-            l_opt_cat = ["All"] + sorted(df_ledger_raw["Item Type"].unique().tolist())
-            l_sel_cat = st.selectbox("Ledger Item Type", l_opt_cat, key="l_cat")
+        df_ledger_raw = q(query_ledger)
 
-        df_ledger = df_ledger_raw.copy()
-        if l_sel_coff != "All": df_ledger = df_ledger[df_ledger["Call-Off No"] == l_sel_coff]
-        if l_sel_cont != "All": df_ledger = df_ledger[df_ledger["Contract #"] == l_sel_cont]
-        if l_sel_br != "All":   df_ledger = df_ledger[df_ledger["Brand"] == l_sel_br]
-        if l_sel_art != "All":  df_ledger = df_ledger[df_ledger["Article"] == l_sel_art]
-        if l_sel_cat != "All":  df_ledger = df_ledger[df_ledger["Item Type"] == l_sel_cat]
+        if df_ledger_raw.empty:
+            st.info("Master Ledger is empty. Upload a contract sheet in Tab 5 first.")
+        else:
+            st.markdown("##### 🛠️ Dynamic Ledger Filters")
+            fl_cols = st.columns(5)
+            
+            with fl_cols[0]:
+                l_opt_coff = ["All"] + sorted(df_ledger_raw["Call-Off No"].unique().tolist())
+                l_sel_coff = st.selectbox("Ledger Call-Off", l_opt_coff, key="l_coff")
+            with fl_cols[1]:
+                l_opt_cont = ["All"] + sorted(df_ledger_raw["Contract #"].unique().tolist())
+                l_sel_cont = st.selectbox("Ledger Contract", l_opt_cont, key="l_cont")
+            with fl_cols[2]:
+                l_opt_br = ["All"] + sorted(df_ledger_raw["Brand"].unique().tolist())
+                l_sel_br = st.selectbox("Ledger Brand", l_opt_br, key="l_brand")
+            with fl_cols[3]:
+                l_opt_art = ["All"] + sorted(df_ledger_raw["Article"].unique().tolist())
+                l_sel_art = st.selectbox("Ledger Article", l_opt_art, key="l_art")
+            with fl_cols[4]:
+                l_opt_cat = ["All"] + sorted(df_ledger_raw["Item Type"].unique().tolist())
+                l_sel_cat = st.selectbox("Ledger Item Type", l_opt_cat, key="l_cat")
 
-        tot_o = df_ledger["Total Ordered"].sum()
-        tot_r = df_ledger["Total Received"].sum()
-        tot_b = df_ledger["Remaining Balance"].sum()
+            df_ledger = df_ledger_raw.copy()
+            if l_sel_coff != "All": df_ledger = df_ledger[df_ledger["Call-Off No"] == l_sel_coff]
+            if l_sel_cont != "All": df_ledger = df_ledger[df_ledger["Contract #"] == l_sel_cont]
+            if l_sel_br != "All":   df_ledger = df_ledger[df_ledger["Brand"] == l_sel_br]
+            if l_sel_art != "All":  df_ledger = df_ledger[df_ledger["Article"] == l_sel_art]
+            if l_sel_cat != "All":  df_ledger = df_ledger[df_ledger["Item Type"] == l_sel_cat]
 
-        st.markdown(f"""<div class="kpi-row">
-          <div class="kpi kb">Filtered Ordered: {round_and_format(tot_o)}</div>
-          <div class="kpi kg">Filtered Received: {round_and_format(tot_r)}</div>
-          <div class="kpi {'kr' if tot_b<0 else 'ka'}">Filtered Balance: {round_and_format(tot_b)}</div>
-        </div>""", unsafe_allow_html=True)
+            tot_o = df_ledger["Total Ordered"].sum()
+            tot_r = df_ledger["Total Received"].sum()
+            tot_b = df_ledger["Remaining Balance"].sum()
+
+            st.markdown(f"""<div class="kpi-row">
+              <div class="kpi kb">Filtered Ordered: {round_and_format(tot_o)}</div>
+              <div class="kpi kg">Filtered Received: {round_and_format(tot_r)}</div>
+              <div class="kpi {'kr' if tot_b<0 else 'ka'}">Filtered Balance: {round_and_format(tot_b)}</div>
+            </div>""", unsafe_allow_html=True)
+
+            st.markdown("##### 🏷️ Item-Wise Remaining Status (Filtered Global Summary)")
+            item_summary = df_ledger.groupby("Item Type")["Remaining Balance"].sum().to_dict()
+            
+            color_classes = {
+                "Inlay Card / Bandrolle": "kb",
+                "Tag Card / Barcode Sticker": "kg",
+                "Barcode Item": "kr",
+                "Safety": "ka",
+                "Washing Paper": "kp",
+                "Transparent Sticker": "ke",
+                "Eco Friendly": "kb"
+            }
+            
+            item_cols = st.columns(3)
+            for idx, it_name in enumerate(ITEM_TYPES):
+                rem_val = item_summary.get(it_name, 0)
+                cls = color_classes.get(it_name, "kb")
+                with item_cols[idx % 3]:
+                    st.markdown(f'<div class="kpi {cls}" style="margin-bottom: 6px;">⏳ Rem. {it_name}<br><b>{round_and_format(rem_val)}</b> Pcs</div>', unsafe_allow_html=True)
+
+            st.markdown("---")
+            st.markdown("### 📌 CONTRACT-WISE SHORTFALL SUMMARY")
+            st.info(" نیچے ہر سیلز کنٹریکٹ کے حساب سے الگ الگ بقایا (Shortfall) بریک ڈاؤن دکھایا گیا ہے:")
+            
+            unique_contracts_in_ledger = sorted(df_ledger["Contract #"].unique().tolist())
+            
+            for contract_no in unique_contracts_in_ledger:
+                df_contract_sub = df_ledger[df_ledger["Contract #"] == contract_no]
+                contract_item_summary = df_contract_sub.groupby("Item Type")["Remaining Balance"].sum().to_dict()
+                
+                has_shortage = any(v > 0 for v in contract_item_summary.values())
+                
+                with st.expander(f"📄 Contract: {contract_no} | {'🚨 Shortage Pending' if has_shortage else '✅ Fully Cleared'}", expanded=True):
+                    sub_cols = st.columns(3)
+                    col_counter = 0
+                    for it_name in ITEM_TYPES:
+                        rem_val_sub = contract_item_summary.get(it_name, 0)
+                        sub_cls = "kr" if rem_val_sub > 0 else "kg"
+                        
+                        with sub_cols[col_counter % 3]:
+                            st.markdown(f'''
+                            <div class="kpi {sub_cls}" style="margin-bottom: 6px; padding: 8px; border-radius: 6px;">
+                                <span style="font-size: 11px; font-weight: 600; display:block;">📦 {it_name}</span>
+                                <span style="font-size: 13px; font-weight: 700;">Rem: {round_and_format(rem_val_sub)} Pcs</span>
+                            </div>
+                            ''', unsafe_allow_html=True)
+                        col_counter += 1
+
+            st.markdown("---")
+            hide_zero = st.checkbox("Hide rows with zero Remaining Balance", key="hide_zero_bal")
+            if hide_zero:
+                df_ledger = df_ledger[df_ledger["Remaining Balance"].apply(round_bal) != 0]
+
+            df_fmt = df_ledger.copy()
+            df_fmt["Total Ordered"]     = df_fmt["Total Ordered"].apply(round_and_format)
+            df_fmt["Total Received"]    = df_fmt["Total Received"].apply(round_and_format)
+            df_fmt["Remaining Balance"] = df_fmt["Remaining Balance"].apply(lambda x: "" if x == 0 else round_and_format(x))
+
+            st.dataframe(df_fmt, use_container_width=True, hide_index=True)
+
+            st.markdown("##### Export options:")
+            btn_c1, btn_c2, btn_c3 = st.columns([2.5, 3, 3.2])
+            
+            with btn_c1:
+                pdf_buf_master = generate_ledger_pdf(item_summary, df_ledger, l_sel_coff, l_sel_cont, l_sel_art, report_type="MASTER")
+                st.download_button(
+                    label="Print Full Master Ledger (PDF)",
+                    data=pdf_buf_master,
+                    file_name=f"Master_Ledger_CO_{l_sel_coff}_CN_{l_sel_cont}.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                    key="btn_print_master"
+                )
+                
+            with btn_c2:
+                df_shortage_only = df_ledger[df_ledger["Remaining Balance"].apply(round_bal) > 0]
+                pdf_buf_shortage = generate_ledger_pdf(item_summary, df_shortage_only, l_sel_coff, l_sel_cont, l_sel_art, report_type="SHORTAGE")
+                st.download_button(
+                    label="Print Shortage / Remaining Only (PDF)",
+                    data=pdf_buf_shortage,
+                    file_name=f"Shortage_Report_CO_{l_sel_coff}_CN_{l_sel_cont}.pdf",
+                    mime="application/pdf",
+                    type="secondary",
+                    key="btn_print_shortage"
+                )
+
+            with btn_c3:
+                df_contract_shortlist = df_ledger[df_ledger["Remaining Balance"].apply(round_bal) > 0]
+                pdf_buf_contract = generate_ledger_pdf(item_summary, df_contract_shortlist, l_sel_coff, l_sel_cont, l_sel_art, report_type="CONTRACT_SHORTLIST")
+                safe_brand = (l_sel_br if l_sel_br != "All" else "AllBrands")
+                safe_cont  = (l_sel_cont if l_sel_cont != "All" else "AllContracts")
+                st.download_button(
+                    label="Print Contract Shortlist (PDF)",
+                    data=pdf_buf_contract,
+                    file_name=f"Contract_Shortlist_{safe_brand}_{safe_cont}.pdf",
+                    mime="application/pdf",
+                    type="secondary",
+                    key="btn_print_contract_shortlist"
+                )
 
             # ═══════════════════════════════════════════════
             # 🆕 NEW ADDITION: CONTRACT-WISE SHORTFALL SUMMARY
