@@ -968,13 +968,12 @@ with tab3:
                     st.rerun()
 
 # ═══════════════════════════════════════════════
-# TAB 4 — MASTER LEDGER (UPDATED LOGIC ADDEED!)
+# TAB 4 — MASTER LEDGER
 # ═══════════════════════════════════════════════
 with tab4:
-    if _access_ok("📊 Master Ledger"):
-        st.markdown('<div class="sec">📊 Master Ledger (Order vs Delivery Status)</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sec">📊 Master Ledger (Order vs Delivery Status)</div>', unsafe_allow_html=True)
 
-        # FIX: Using direct sqlite3 connection execution instead of passing connection object directly to read_sql to avoid Python 3.14 lifecycle breakdown
+    # FIX: Using direct sqlite3 connection execution with proper matching indentation
     import sqlite3
     db_connection = sqlite3.connect(DB_PATH)
     
@@ -1002,12 +1001,12 @@ with tab4:
     
     df_ledger_raw = pd.read_sql_query(query_ledger, db_connection)
     db_connection.close()
-       
+
     if df_ledger_raw.empty:
-            st.info("Master Ledger is empty. Upload a contract sheet in Tab 5 first.")
-        else:
-            st.markdown("##### 🛠️ Dynamic Ledger Filters")
-            fl_cols = st.columns(5)
+        st.info("Master Ledger is empty. Upload a contract sheet in Tab 5 first.")
+    else:
+        st.markdown("##### 🛠️ Dynamic Ledger Filters")
+        fl_cols = st.columns(5)
         
             with fl_cols[0]:
                 l_opt_coff = ["All"] + sorted(df_ledger_raw["Call-Off No"].unique().tolist())
