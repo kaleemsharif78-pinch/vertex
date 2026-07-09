@@ -443,6 +443,15 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# BUGFIX: _init_schema() (creates tables + seeds the default admin account)
+# used to only run lazily inside get_conn(). The login form below only calls
+# q(), which never triggered it — so after a fresh reboot, a login attempt
+# could run before the admin account was (re)seeded, wrongly showing
+# "Invalid username or password" even on a correct first login. Calling it
+# explicitly here guarantees schema + seeding always exist before anything
+# else runs. st.cache_resource makes this a cheap no-op after the first call.
+_init_schema()
+
 # ═══════════════════════════════════════════════
 # AUTHENTICATION & ROLE-BASED ACCESS CONTROL (NEW — Cloud version only)
 # ═══════════════════════════════════════════════
