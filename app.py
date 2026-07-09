@@ -1146,8 +1146,7 @@ with tab4:
         st.info("💡 نیچے ہر سیلز کنٹریکٹ کے حساب سے الگ الگ بقایا (Shortfall) بریک ڈاؤن دکھایا گیا ہے:")
         
             # گوبل لیجر سے اس کال آف کے تمام یونیک کنٹریکٹس نکالیں
-            unique_contracts_in_ledger = sorted(df_ledger["Contract #"].unique().tolist())
-        
+            unique_contracts_in_ledger = sorted(df_ledger["Contract #"].unique().tolist())      
             for contract_no in unique_contracts_in_ledger:
                 # اس مخصوص کنٹریکٹ کا ڈیٹا فلٹر کریں
                 df_contract_sub = df_ledger[df_ledger["Contract #"] == contract_no]
