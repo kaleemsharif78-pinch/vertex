@@ -1087,52 +1087,111 @@ with tab4:
             df_fmt = df_ledger.copy()
             df_fmt["Total Ordered"]     = df_fmt["Total Ordered"].apply(round_and_format)
             df_fmt["Total Received"]    = df_fmt["Total Received"].apply(round_and_format)
-            df_fmt["Remaining Balance"] = df_fmt["Remaining Balance"].apply(lambda x: "" if x == 0 else round_and_format(x))
+            st.markdown(f"""<div class="kpi-row">
+          <div class="kpi kb">Filtered Ordered: {round_and_format(tot_o)}</div>
+          <div class="kpi kg">Filtered Received: {round_and_format(tot_r)}</div>
+          <div class="kpi {'kr' if tot_b<0 else 'ka'}">Filtered Balance: {round_and_format(tot_b)}</div>
+        </div>""", unsafe_allow_html=True)
 
-            st.dataframe(df_fmt, use_container_width=True, hide_index=True)
-
-            st.markdown("##### 🖨️ Export options:")
-            btn_c1, btn_c2, btn_c3 = st.columns([2.5, 3, 3.2])
+        st.markdown("##### 🏷️ Item-Wise Remaining Status (Filtered Global Summary)")
+        item_summary = df_ledger.groupby("Item Type")["Remaining Balance"].sum().to_dict()
         
-            with btn_c1:
-                pdf_buf_master = generate_ledger_pdf(item_summary, df_ledger, l_sel_coff, l_sel_cont, l_sel_art, report_type="MASTER")
-                st.download_button(
-                    label="🖨️ Print Full Master Ledger (PDF)",
-                    data=pdf_buf_master,
-                    file_name=f"Master_Ledger_CO_{l_sel_coff}_CN_{l_sel_cont}.pdf",
-                    mime="application/pdf",
-                    type="primary",
-                    key="btn_print_master"
-                )
-            
-            with btn_c2:
-                df_shortage_only = df_ledger[df_ledger["Remaining Balance"].apply(round_bal) > 0]
-                pdf_buf_shortage = generate_ledger_pdf(item_summary, df_shortage_only, l_sel_coff, l_sel_cont, l_sel_art, report_type="SHORTAGE")
-                st.download_button(
-                    label="🚨 Print Shortage / Remaining Only (PDF)",
-                    data=pdf_buf_shortage,
-                    file_name=f"Shortage_Report_CO_{l_sel_coff}_CN_{l_sel_cont}.pdf",
-                    mime="application/pdf",
-                    type="secondary",
-                    key="btn_print_shortage"
-                )
+        color_classes = {
+            "Inlay Card / Bandrolle": "kb",
+            "Tag Card / Barcode Sticker": "kg",
+            "Barcode Item": "kr",
+            "Safety": "ka",
+            "Washing Paper": "kp",
+            "Transparent Sticker": "ke",
+            "Eco Friendly": "kb"
+        }
+        
+        item_cols = st.columns(3)
+        for idx, it_name in enumerate(ITEM_TYPES):
+            rem_val = item_summary.get(it_name, 0)
+            cls = color_classes.get(it_name, "kb")
+            with item_cols[idx % 3]:
+                st.markdown(f'<div class="kpi {cls}" style="margin-bottom: 6px;">⏳ Rem. {it_name}<br><b>{round_and_format(rem_val)}</b> Pcs</div>', unsafe_allow_html=True)
 
-            with btn_c3:
-                # Contract-wise Shortlist: only ACTIVE/PENDING items for the currently
-                # selected Brand + Contract filters. Strict rounding removes any
-                # plus/minus float micro-garbage so true-zero articles never appear.
-                df_contract_shortlist = df_ledger[df_ledger["Remaining Balance"].apply(round_bal) > 0]
-                pdf_buf_contract = generate_ledger_pdf(item_summary, df_contract_shortlist, l_sel_coff, l_sel_cont, l_sel_art, report_type="CONTRACT_SHORTLIST")
-                safe_brand = (l_sel_br if l_sel_br != "All" else "AllBrands")
-                safe_cont  = (l_sel_cont if l_sel_cont != "All" else "AllContracts")
-                st.download_button(
-                    label="📋 Print Contract Shortlist (PDF)",
-                    data=pdf_buf_contract,
-                    file_name=f"Contract_Shortlist_{safe_brand}_{safe_cont}.pdf",
-                    mime="application/pdf",
-                    type="secondary",
-                    key="btn_print_contract_shortlist"
-                )
+        st.markdown("---")
+        st.markdown("### 📌 CONTRACT-WISE SHORTFALL SUMMARY")
+        st.info(" نیچے ہر سیلز کنٹریکٹ کے حساب سے الگ الگ بقایا (Shortfall) بریک ڈاؤن دکھایا گیا ہے:")
+        
+        unique_contracts_in_ledger = sorted(df_ledger["Contract #"].unique().tolist())
+        
+        for contract_no in unique_contracts_in_ledger:
+            df_contract_sub = df_ledger[df_ledger["Contract #"] == contract_no]
+            contract_item_summary = df_contract_sub.groupby("Item Type")["Remaining Balance"].sum().to_dict()
+            
+            has_shortage = any(v > 0 for v in contract_item_summary.values())
+            
+            with st.expander(f"📄 Contract: {contract_no} | {'🚨 Shortage Pending' if has_shortage else '✅ Fully Cleared'}", expanded=True):
+                sub_cols = st.columns(3)
+                col_counter = 0
+                for it_name in ITEM_TYPES:
+                    rem_val_sub = contract_item_summary.get(it_name, 0)
+                    sub_cls = "kr" if rem_val_sub > 0 else "kg"
+                    
+                    with sub_cols[col_counter % 3]:
+                        st.markdown(f'''
+                        <div class="kpi {sub_cls}" style="margin-bottom: 6px; padding: 8px; border-radius: 6px;">
+                            <span style="font-size: 11px; font-weight: 600; display:block;">📦 {it_name}</span>
+                            <span style="font-size: 13px; font-weight: 700;">Rem: {round_and_format(rem_val_sub)} Pcs</span>
+                        </div>
+                        ''', unsafe_allow_html=True)
+                    col_counter += 1
+
+        st.markdown("---")
+        hide_zero = st.checkbox("Hide rows with zero Remaining Balance", key="hide_zero_bal")
+        if hide_zero:
+            df_ledger = df_ledger[df_ledger["Remaining Balance"].apply(round_bal) != 0]
+
+        df_fmt = df_ledger.copy()
+        df_fmt["Total Ordered"]     = df_fmt["Total Ordered"].apply(round_and_format)
+        df_fmt["Total Received"]    = df_fmt["Total Received"].apply(round_and_format)
+        df_fmt["Remaining Balance"] = df_fmt["Remaining Balance"].apply(lambda x: "" if x == 0 else round_and_format(x))
+
+        st.dataframe(df_fmt, use_container_width=True, hide_index=True)
+
+        st.markdown("##### Export options:")
+        btn_c1, btn_c2, btn_c3 = st.columns([2.5, 3, 3.2])
+        
+        with btn_c1:
+            pdf_buf_master = generate_ledger_pdf(item_summary, df_ledger, l_sel_coff, l_sel_cont, l_sel_art, report_type="MASTER")
+            st.download_button(
+                label="Print Full Master Ledger (PDF)",
+                data=pdf_buf_master,
+                file_name=f"Master_Ledger_CO_{l_sel_coff}_CN_{l_sel_cont}.pdf",
+                mime="application/pdf",
+                type="primary",
+                key="btn_print_master"
+            )
+            
+        with btn_c2:
+            df_shortage_only = df_ledger[df_ledger["Remaining Balance"].apply(round_bal) > 0]
+            pdf_buf_shortage = generate_ledger_pdf(item_summary, df_shortage_only, l_sel_coff, l_sel_cont, l_sel_art, report_type="SHORTAGE")
+            st.download_button(
+                label="Print Shortage / Remaining Only (PDF)",
+                data=pdf_buf_shortage,
+                file_name=f"Shortage_Report_CO_{l_sel_coff}_CN_{l_sel_cont}.pdf",
+                mime="application/pdf",
+                type="secondary",
+                key="btn_print_shortage"
+            )
+
+        with btn_c3:
+            df_contract_shortlist = df_ledger[df_ledger["Remaining Balance"].apply(round_bal) > 0]
+            pdf_buf_contract = generate_ledger_pdf(item_summary, df_contract_shortlist, l_sel_coff, l_sel_cont, l_sel_art, report_type="CONTRACT_SHORTLIST")
+            safe_brand = (l_sel_br if l_sel_br != "All" else "AllBrands")
+            safe_cont  = (l_sel_cont if l_sel_cont != "All" else "AllContracts")
+            st.download_button(
+                label="Print Contract Shortlist (PDF)",
+                data=pdf_buf_contract,
+                file_name=f"Contract_Shortlist_{safe_brand}_{safe_cont}.pdf",
+                mime="application/pdf",
+                type="secondary",
+                key="btn_print_contract_shortlist"
+            )
 
 # ═══════════════════════════════════════════════
 # TAB 5 — SHEET UPLOAD (UNCHANGED)
