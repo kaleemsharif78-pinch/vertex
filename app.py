@@ -1002,7 +1002,8 @@ with tab4:
     
     df_ledger_raw = pd.read_sql_query(query_ledger, db_connection)
     db_connection.close()
-        if df_ledger_raw.empty:
+       
+    if df_ledger_raw.empty:
             st.info("Master Ledger is empty. Upload a contract sheet in Tab 5 first.")
         else:
             st.markdown("##### 🛠️ Dynamic Ledger Filters")
