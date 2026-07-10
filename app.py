@@ -35,7 +35,17 @@ def _get_engine():
         st.error("⚠️ DB_URL is not configured in `.streamlit/secrets.toml`. "
                  "Add e.g. DB_URL = \"postgresql+psycopg2://user:pass@host:5432/dbname\" and restart.")
         st.stop()
-    return create_engine(db_url, pool_pre_ping=True)
+    # PERFORMANCE: keep a small pool of already-open connections ready to
+    # reuse instead of opening a brand-new TCP+SSL connection to the remote
+    # DB for every single query (each of those round-trips is the real cost
+    # once you're on a remote Postgres, especially cross-region).
+    return create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10,
+        pool_recycle=300,
+    )
 
 def _qmark_to_named(sql, params):
     """Converts sqlite-style '?' placeholders + a positional params list into
@@ -198,6 +208,7 @@ def scalar(sql, params=None):
     conn.close()
     return (r[0] or 0) if r else 0
 
+@st.cache_data(ttl=20, show_spinner=False)
 def get_calloff_list():
     return q("SELECT DISTINCT call_off_no FROM sheet_orders WHERE TRIM(call_off_no)!='' ORDER BY call_off_no")["call_off_no"].tolist()
 
@@ -528,31 +539,34 @@ with tab1:
 
         if gs and len(gs.strip()) >= 2:
             gq = f"%{gs.strip()}%"
-            sug_frames = []
-            for sql, label in [
-                ("SELECT DISTINCT po_no as val FROM sheet_orders WHERE po_no LIKE ? AND TRIM(po_no)!='' LIMIT 4", "PO No."),
-                ("SELECT DISTINCT article as val FROM sheet_orders WHERE article LIKE ? LIMIT 4", "Article"),
-                ("SELECT DISTINCT dc_no as val FROM inventory WHERE dc_no LIKE ? AND TRIM(dc_no)!='' LIMIT 4", "DC No."),
-                ("SELECT DISTINCT company_token as val FROM inventory WHERE company_token LIKE ? AND TRIM(company_token)!='' LIMIT 4", "Token"),
-                ("SELECT DISTINCT call_off_no as val FROM sheet_orders WHERE call_off_no LIKE ? LIMIT 4", "Call-Off"),
-                ("SELECT DISTINCT contract_no as val FROM inventory WHERE contract_no LIKE ? AND TRIM(contract_no)!='' LIMIT 4", "Contract #"),
-            ]:
-                df_s = q(sql, [gq])
-                if not df_s.empty:
-                    df_s["t"] = label
-                    sug_frames.append(df_s)
+            # PERFORMANCE: these used to be 6 separate round-trips to the DB
+            # on every keystroke. Combined into 1 query (each branch wrapped
+            # as its own subquery so per-branch LIMIT works portably on
+            # SQLite, PostgreSQL and MySQL alike).
+            sug_sql = """
+                SELECT * FROM (SELECT 'PO No.'    AS t, po_no          AS val FROM sheet_orders WHERE po_no LIKE ? AND TRIM(po_no)!='' LIMIT 4) x1
+                UNION ALL
+                SELECT * FROM (SELECT 'Article'   AS t, article        AS val FROM sheet_orders WHERE article LIKE ? LIMIT 4) x2
+                UNION ALL
+                SELECT * FROM (SELECT 'DC No.'    AS t, dc_no          AS val FROM inventory WHERE dc_no LIKE ? AND TRIM(dc_no)!='' LIMIT 4) x3
+                UNION ALL
+                SELECT * FROM (SELECT 'Token'     AS t, company_token  AS val FROM inventory WHERE company_token LIKE ? AND TRIM(company_token)!='' LIMIT 4) x4
+                UNION ALL
+                SELECT * FROM (SELECT 'Call-Off'  AS t, call_off_no    AS val FROM sheet_orders WHERE call_off_no LIKE ? LIMIT 4) x5
+                UNION ALL
+                SELECT * FROM (SELECT 'Contract #' AS t, contract_no  AS val FROM inventory WHERE contract_no LIKE ? AND TRIM(contract_no)!='' LIMIT 4) x6
+            """
+            sug = q(sug_sql, [gq, gq, gq, gq, gq, gq]).dropna()
+            sug = sug[sug["val"].astype(str).str.strip() != ""]
 
-            if sug_frames:
-                sug = pd.concat(sug_frames).dropna()
-                sug = sug[sug["val"].astype(str).str.strip() != ""]
-                if not sug.empty:
-                    st.markdown("**Quick select:**")
-                    cols_s = st.columns(min(5, len(sug)))
-                    for i, (_, sg) in enumerate(sug.iterrows()):
-                        with cols_s[i % 5]:
-                            if st.button(f"[{sg['t']}] {sg['val']}", key=f"sug_{i}_{sg['val']}"):
-                                st.session_state["gs_sel"] = str(sg["val"])
-                                st.rerun()
+            if not sug.empty:
+                st.markdown("**Quick select:**")
+                cols_s = st.columns(min(5, len(sug)))
+                for i, (_, sg) in enumerate(sug.iterrows()):
+                    with cols_s[i % 5]:
+                        if st.button(f"[{sg['t']}] {sg['val']}", key=f"sug_{i}_{sg['val']}"):
+                            st.session_state["gs_sel"] = str(sg["val"])
+                            st.rerun()
 
             active = st.session_state.get("gs_sel","") or gs.strip()
             aq = f"%{active}%"
@@ -827,27 +841,34 @@ with tab3:
             st.markdown("##### 🛠️ Advanced Multi-Filters")
             f_cols = st.columns(6)
 
-            def _distinct(col):
-                return q(f"SELECT DISTINCT {col} FROM inventory WHERE TRIM({col})!='' ORDER BY {col}")[col].tolist()
+            # PERFORMANCE: on a remote DB, 6 separate round-trips (one per
+            # dropdown) are much slower than 1. This combines them into a
+            # single UNION ALL query, cached briefly so repeated reruns
+            # (e.g. while typing elsewhere on the page) don't re-hit the DB.
+            @st.cache_data(ttl=15, show_spinner=False)
+            def _tab3_filter_options():
+                cols = ["call_off_no", "po_no", "article", "dc_no", "company_token", "category"]
+                union_sql = " UNION ALL ".join(
+                    f"SELECT '{c}' AS col_name, {c} AS val FROM inventory WHERE TRIM({c})!=''" for c in cols
+                )
+                df = q(union_sql)
+                return {c: sorted(df.loc[df["col_name"] == c, "val"].dropna().unique().tolist()) for c in cols}
+
+            _opts = _tab3_filter_options()
 
             with f_cols[0]:
-                opt_coff = ["All"] + _distinct("call_off_no")
-                sel_coff = st.selectbox("Filter Call-Off", opt_coff, key="f3_coff")
+                sel_coff = st.selectbox("Filter Call-Off", ["All"] + _opts["call_off_no"], key="f3_coff")
             with f_cols[1]:
-                opt_po = ["All"] + _distinct("po_no")
-                sel_po = st.selectbox("Filter PO No.", opt_po, key="f3_po")
+                sel_po = st.selectbox("Filter PO No.", ["All"] + _opts["po_no"], key="f3_po")
             with f_cols[2]:
-                opt_art = ["All"] + _distinct("article")
-                sel_art = st.selectbox("Filter Article", opt_art, key="f3_art")
+                sel_art = st.selectbox("Filter Article", ["All"] + _opts["article"], key="f3_art")
             with f_cols[3]:
-                opt_dc = ["All"] + _distinct("dc_no")
-                sel_dc = st.selectbox("Filter DC No.", opt_dc, key="f3_dc")
+                sel_dc = st.selectbox("Filter DC No.", ["All"] + _opts["dc_no"], key="f3_dc")
             with f_cols[4]:
-                opt_tok = ["All"] + _distinct("company_token")
-                sel_tok = st.selectbox("Filter Token", opt_tok, key="f3_tok")
+                sel_tok = st.selectbox("Filter Token", ["All"] + _opts["company_token"], key="f3_tok")
             with f_cols[5]:
-                opt_cat = ["All"] + _distinct("category")
-                sel_cat = st.selectbox("Filter Item Type", opt_cat, key="f3_cat")
+                sel_cat = st.selectbox("Filter Item Type", ["All"] + _opts["category"], key="f3_cat")
+
 
             where_sql, params = "WHERE 1=1", []
             if sel_coff != "All": where_sql += " AND call_off_no=?";    params.append(sel_coff)
