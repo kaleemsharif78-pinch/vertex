@@ -974,8 +974,7 @@ with tab4:
     if _access_ok("📊 Master Ledger"):
         st.markdown('<div class="sec">📊 Master Ledger (Order vs Delivery Status)</div>', unsafe_allow_html=True)
 
-        conn = get_conn()
-        df_ledger_raw = pd.read_sql("""
+        df_ledger_raw = q("""
             SELECT
                 so.call_off_no        AS "Call-Off No",
                 so.sale_contract      AS "Contract #",
@@ -995,8 +994,7 @@ with tab4:
                   AND so.category   = inv.category
             GROUP BY so.call_off_no, so.sale_contract, so.brand, so.article, so.category
             ORDER BY so.call_off_no DESC, so.article ASC
-        """, conn)
-        conn.close()
+        """)
 
         if df_ledger_raw.empty:
             st.info("Master Ledger is empty. Upload a contract sheet in Tab 5 first.")
