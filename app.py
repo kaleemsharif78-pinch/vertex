@@ -1,3 +1,14 @@
+import sys
+# اگر سرور پر psycopg2 ڈھونڈا جائے تو یہ خودکار طور پر pg8000 کو اس کی جگہ سیٹ کر دے گا
+try:
+    import pg8000
+    sys.modules['psycopg2'] = pg8000
+except ImportError:
+    pass
+
+import streamlit as st
+import pandas as pd
+# باقی پرانا امپورٹ کوڈ ویسے ہی رہنے دیں...
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
