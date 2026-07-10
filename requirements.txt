@@ -1,5 +1,6 @@
 streamlit
+pandas
 sqlalchemy
 psycopg2-binary
-pandas
 reportlab
+openpyxl
