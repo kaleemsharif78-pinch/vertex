@@ -86,6 +86,7 @@ def _init_schema():
     else:
         pk = "INTEGER PRIMARY KEY AUTOINCREMENT"
 
+    # PHASE 1 — tables. Its own transaction.
     with engine.begin() as conn:
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS sheet_orders (
@@ -112,44 +113,58 @@ def _init_schema():
                 username TEXT UNIQUE, password_hash TEXT, role TEXT,
                 full_name TEXT, created_at TEXT)"""))
 
-        insp = inspect(engine)
-        inv_cols = [c["name"] for c in insp.get_columns("inventory")]
-        for col in ["entry_date", "remark", "company_token", "contract_no", "style_type"]:
-            if col not in inv_cols:
+    # PHASE 2 — column migration. Its own transaction, only runs at all if
+    # something is actually missing (cuts a round-trip on every normal boot).
+    insp = inspect(engine)
+    inv_cols = [c["name"] for c in insp.get_columns("inventory")]
+    missing_cols = [c for c in ["entry_date", "remark", "company_token", "contract_no", "style_type"] if c not in inv_cols]
+    if missing_cols:
+        with engine.begin() as conn:
+            for col in missing_cols:
                 conn.execute(text(f"ALTER TABLE inventory ADD COLUMN {col} TEXT DEFAULT ''"))
 
-        # Indexes. MySQL has no "CREATE INDEX IF NOT EXISTS", so each is
-        # wrapped individually — a "duplicate index" error is caught and
-        # ignored on any dialect.
-        index_stmts = [
-            "CREATE INDEX idx_inv_article_category ON inventory(article, category)",
-            "CREATE INDEX idx_inv_calloff           ON inventory(call_off_no)",
-            "CREATE INDEX idx_inv_contract          ON inventory(contract_no)",
-            "CREATE INDEX idx_inv_po                ON inventory(po_no)",
-            "CREATE INDEX idx_inv_dc                ON inventory(dc_no)",
-            "CREATE INDEX idx_inv_token             ON inventory(company_token)",
-            "CREATE INDEX idx_inv_entrydate         ON inventory(entry_date)",
-            "CREATE INDEX idx_so_calloff            ON sheet_orders(call_off_no)",
-            "CREATE INDEX idx_so_article_category   ON sheet_orders(article, category)",
-            "CREATE INDEX idx_so_contract           ON sheet_orders(sale_contract)",
-            "CREATE INDEX idx_so_po                 ON sheet_orders(po_no)",
-            "CREATE INDEX idx_bilty_calloff_art     ON bilty(call_off_no, article, category)",
-            "CREATE INDEX idx_bilty_contract        ON bilty(contract_no)",
-        ]
-        existing_idx = {ix["name"] for t in ["inventory", "sheet_orders", "bilty"] for ix in insp.get_indexes(t)}
-        for stmt in index_stmts:
-            idx_name = stmt.split()[2]
-            if idx_name in existing_idx:
-                continue
+    # PHASE 3 — indexes. BUGFIX: these used to run in the SAME transaction as
+    # everything else, wrapped in a per-statement try/except. On PostgreSQL,
+    # one failed statement (e.g. index already exists) poisons the WHOLE
+    # transaction — every statement after it (including admin-seeding below)
+    # then also fails, even though the Python try/except silently swallowed
+    # it. Since _init_schema() then raised, st.cache_resource never cached a
+    # successful run, so this entire setup was silently re-running on every
+    # single page load. Fixed by:
+    #  - Using "CREATE INDEX IF NOT EXISTS" directly on Postgres/SQLite (one
+    #    idempotent round-trip each, no separate existence-check needed).
+    #  - Giving each statement its OWN transaction on MySQL (which lacks
+    #    IF NOT EXISTS for indexes), so one failure can't cascade.
+    index_defs = [
+        ("idx_inv_article_category", "inventory(article, category)"),
+        ("idx_inv_calloff",          "inventory(call_off_no)"),
+        ("idx_inv_contract",         "inventory(contract_no)"),
+        ("idx_inv_po",               "inventory(po_no)"),
+        ("idx_inv_dc",               "inventory(dc_no)"),
+        ("idx_inv_token",            "inventory(company_token)"),
+        ("idx_inv_entrydate",        "inventory(entry_date)"),
+        ("idx_so_calloff",           "sheet_orders(call_off_no)"),
+        ("idx_so_article_category",  "sheet_orders(article, category)"),
+        ("idx_so_contract",          "sheet_orders(sale_contract)"),
+        ("idx_so_po",                "sheet_orders(po_no)"),
+        ("idx_bilty_calloff_art",    "bilty(call_off_no, article, category)"),
+        ("idx_bilty_contract",       "bilty(contract_no)"),
+    ]
+    if dialect == "mysql":
+        for name, target in index_defs:
             try:
-                conn.execute(text(stmt))
+                with engine.begin() as conn:
+                    conn.execute(text(f"CREATE INDEX {name} ON {target}"))
             except Exception:
-                pass  # already exists on this dialect, or created concurrently
+                pass  # already exists — isolated transaction, doesn't affect the others
+    else:
+        with engine.begin() as conn:
+            for name, target in index_defs:
+                conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {target}"))
 
-        # Seed one default admin account if app_users is empty, so the very
-        # first login always works: username "admin" / password "admin123".
-        # ⚠️ Change this password immediately after first login (see the
-        # "👤 User Management" tab, Admin-only).
+    # PHASE 4 — default admin seed. Its own transaction, guaranteed to run
+    # regardless of what happened with indexes above.
+    with engine.begin() as conn:
         user_count = conn.execute(text("SELECT COUNT(*) FROM app_users")).scalar()
         if not user_count:
             conn.execute(
@@ -403,48 +418,6 @@ div[data-testid="stExpander"]{background-color:#0f172a !important;
      border:1px solid #334155 !important;border-radius:8px;}
 </style>
 """, unsafe_allow_html=True)
-
-components.html("""
-<script>
-    function initCursor() {
-        const targetDoc = window.parent.document;
-        if (targetDoc.getElementById('naba-cursor-txt')) return;
-        const style = targetDoc.createElement('style');
-        style.innerHTML = `
-            #naba-cursor-txt {
-                position: fixed;
-                pointer-events: none;
-                z-index: 999999;
-                font-size: 11px;
-                font-weight: 700;
-                color: #38bdf8 !important;
-                background-color: rgba(15, 23, 42, 0.9);
-                padding: 3px 7px;
-                border-radius: 4px;
-                border: 1px solid #334155;
-                font-family: 'Inter', sans-serif;
-                transform: translate(15px, 15px);
-                display: none;
-                box-shadow: 0 2px 5px rgba(0,0,0,0.5);
-            }
-        `;
-        targetDoc.head.appendChild(style);
-        const div = targetDoc.createElement('div');
-        div.id = 'naba-cursor-txt';
-        div.innerText = 'NABA Tech';
-        targetDoc.body.appendChild(div);
-        targetDoc.addEventListener('mousemove', function(e) {
-            div.style.left = e.clientX + 'px';
-            div.style.top = e.clientY + 'px';
-            if (div.style.display !== 'block') { div.style.display = 'block'; }
-        });
-        targetDoc.addEventListener('mouseleave', function() {
-            div.style.display = 'none';
-        });
-    }
-    setTimeout(initCursor, 500);
-</script>
-""", height=0, width=0)
 
 st.markdown("""
 <div class="hdr">
