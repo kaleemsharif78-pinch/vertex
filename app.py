@@ -906,7 +906,7 @@ if "⚙️ User Management" in tab_map:
                         conn.close()
                         st.success(f"✅ Password reset for '{rp_user}'.")
 
-        st.markdown("---\")
+        st.markdown("---")
         st.markdown("##### 📋 All Users")
         df_users = q("SELECT username AS Username, full_name AS \"Full Name\", role AS Role, created_at AS \"Created At\" FROM app_users ORDER BY username")
         st.dataframe(df_users, use_container_width=True, hide_index=True)
