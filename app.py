@@ -982,8 +982,8 @@ with tab4:
                 so.article            AS "Article",
                 so.category           AS "Item Type",
                 SUM(so.order_qty)     AS "Total Ordered",
-                COALESCE(inv.total_received, 0)                        AS "Total Received",
-                SUM(so.order_qty) - COALESCE(inv.total_received, 0)   AS "Remaining Balance"
+                MAX(COALESCE(inv.total_received, 0))                        AS "Total Received",
+                SUM(so.order_qty) - MAX(COALESCE(inv.total_received, 0))   AS "Remaining Balance"
             FROM sheet_orders so
             LEFT JOIN (
                 SELECT call_off_no, article, category, SUM(qty) AS total_received
