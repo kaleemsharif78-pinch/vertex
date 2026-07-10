@@ -123,6 +123,15 @@ def _init_schema():
             for col in missing_cols:
                 conn.execute(text(f"ALTER TABLE inventory ADD COLUMN {col} TEXT DEFAULT ''"))
 
+    # NEW ADDITION: last_seen column on app_users, powers the Active Users
+    # display. Same isolated-migration pattern as above.
+    au_cols = [c["name"] for c in insp.get_columns("app_users")]
+    missing_au_cols = [c for c in ["last_seen"] if c not in au_cols]
+    if missing_au_cols:
+        with engine.begin() as conn:
+            for col in missing_au_cols:
+                conn.execute(text(f"ALTER TABLE app_users ADD COLUMN {col} TEXT DEFAULT ''"))
+
     # PHASE 3 — indexes. BUGFIX: these used to run in the SAME transaction as
     # everything else, wrapped in a per-statement try/except. On PostgreSQL,
     # one failed statement (e.g. index already exists) poisons the WHOLE
@@ -172,6 +181,17 @@ def _init_schema():
                      "VALUES (:u,:p,:r,:f,:c)"),
                 {"u": "admin", "p": _hash_password("admin123"), "r": "Admin",
                  "f": "Default Admin", "c": str(datetime.datetime.now())})
+
+    # PHASE 5 — NEW ADDITION: site_stats table for the Visit Counter. Own
+    # transaction, seeds the 'total_visits' row once if missing.
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS site_stats (
+                id {pk},
+                stat_key TEXT UNIQUE, stat_value INTEGER DEFAULT 0)"""))
+        vc = conn.execute(text("SELECT COUNT(*) FROM site_stats WHERE stat_key='total_visits'")).scalar()
+        if not vc:
+            conn.execute(text("INSERT INTO site_stats (stat_key, stat_value) VALUES ('total_visits', 0)"))
     return True
 
 def get_conn():
@@ -385,7 +405,7 @@ def generate_ledger_pdf(df_summary, df_articles, sel_coff, sel_cont, sel_art, re
 # ─────────────────────────────────────────────
 # PAGE CONFIG & CSS
 # ─────────────────────────────────────────────
-st.set_page_config(page_title="NABA Inventory | Vertex", layout="wide", page_icon="📦")
+st.set_page_config(page_title="Vertex Packaging | Inventory System", layout="wide", page_icon="📦")
 
 st.markdown("""
 <style>
@@ -421,9 +441,8 @@ div[data-testid="stExpander"]{background-color:#0f172a !important;
 
 st.markdown("""
 <div class="hdr">
-  <h1>📦 NABA Packaging Inventory — Smart Tracker</h1>
-  <p class="cl">🏢 Customer: Vertex (Shahzad Bhai) — Lahore</p>
-  <p class="sb">NABA TECH BY KALEEM ULLAH SHARIF</p>
+  <h1>📦 Vertex Packaging — Smart Inventory Tracker</h1>
+  <p class="cl">🏢 CEO: Shahzad Bhai — Lahore</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -435,6 +454,27 @@ st.markdown("""
 # explicitly here guarantees schema + seeding always exist before anything
 # else runs. st.cache_resource makes this a cheap no-op after the first call.
 _init_schema()
+
+# ═══════════════════════════════════════════════
+# NEW ADDITION: Trial Version Notice (pure addition, no layout/CSS changed)
+# ═══════════════════════════════════════════════
+st.warning("⚠️ **Trial Version Notice:** This system is currently running on a **Trial Basis** for testing purposes. "
+           "یہ نظام فی الحال ٹیسٹنگ کے مقاصد کے لیے ٹرائل بیس پر چل رہا ہے۔")
+
+# ═══════════════════════════════════════════════
+# NEW ADDITION: Website Visit Counter — counts once per new browser session
+# (not on every rerun/click), stored in the site_stats table. Shown even
+# before login, since a "visit" happens as soon as the page loads.
+# ═══════════════════════════════════════════════
+if "visit_counted" not in st.session_state:
+    _vc_conn = get_conn()
+    _vc_conn.execute("UPDATE site_stats SET stat_value = stat_value + 1 WHERE stat_key='total_visits'")
+    _vc_conn.commit()
+    _vc_conn.close()
+    st.session_state["visit_counted"] = True
+
+_total_visits = scalar("SELECT stat_value FROM site_stats WHERE stat_key='total_visits'")
+st.caption(f"👁️ Total Visits: {int(_total_visits):,}")
 
 # ═══════════════════════════════════════════════
 # AUTHENTICATION & ROLE-BASED ACCESS CONTROL (NEW — Cloud version only)
@@ -466,9 +506,34 @@ if st.session_state["auth_user"] is None:
 current_user = st.session_state["auth_user"]
 current_role = current_user["role"]
 
+# NEW ADDITION: update this user's last_seen timestamp on every rerun, and
+# build the Active Users list. Admins are ALWAYS excluded from this list —
+# per the strict requirement, nobody (including other viewers) should be
+# able to tell an Admin is online.
+_now_ts = str(datetime.datetime.now())
+_conn_ls = get_conn()
+_conn_ls.execute("UPDATE app_users SET last_seen=? WHERE username=?", (_now_ts, current_user["username"]))
+_conn_ls.commit()
+_conn_ls.close()
+
+_ACTIVE_WINDOW_MINUTES = 5
+_df_active = q("SELECT username, role, full_name, last_seen FROM app_users "
+               "WHERE last_seen IS NOT NULL AND last_seen != '' AND role != 'Admin'")
+_active_list = []
+_now_dt = datetime.datetime.now()
+for _, _r in _df_active.iterrows():
+    try:
+        _ls = datetime.datetime.fromisoformat(_r["last_seen"])
+        if (_now_dt - _ls).total_seconds() <= _ACTIVE_WINDOW_MINUTES * 60:
+            _active_list.append(f"{_r['full_name']} ({_r['role']})")
+    except Exception:
+        pass
+
 top_c1, top_c2 = st.columns([5, 1])
 with top_c1:
     st.caption(f"👋 Logged in as **{current_user['full_name']}** ({current_user['username']}) — Role: **{current_role}**")
+    if _active_list:
+        st.caption("🟢 Active now: " + ", ".join(_active_list))
 with top_c2:
     if st.button("🚪 Logout", key="logout_btn"):
         st.session_state["auth_user"] = None
