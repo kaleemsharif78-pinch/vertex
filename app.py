@@ -1,14 +1,3 @@
-import sys
-# اگر سرور پر psycopg2 ڈھونڈا جائے تو یہ خودکار طور پر pg8000 کو اس کی جگہ سیٹ کر دے گا
-try:
-    import pg8000
-    sys.modules['psycopg2'] = pg8000
-except ImportError:
-    pass
-
-import streamlit as st
-import pandas as pd
-# باقی پرانا امپورٹ کوڈ ویسے ہی رہنے دیں...
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -25,22 +14,25 @@ from reportlab.lib import colors
 from sqlalchemy import create_engine, text, inspect
 
 # ═══════════════════════════════════════════════
-# DATABASE SYSTEM — CLOUD (PostgreSQL / MySQL via SQLAlchemy)
+# DATABASE SYSTEM — CLOUD (Using pg8000 for PostgreSQL safely)
 # ═══════════════════════════════════════════════
-# Set your connection string in .streamlit/secrets.toml as:
-#   DB_URL = "postgresql+psycopg2://user:password@host:5432/dbname"
-#   -- or --
-#   DB_URL = "mysql+pymysql://user:password@host:3306/dbname"
-# (For local dry-testing only, "sqlite:///textile_inventory.db" also works.)
-#
-# IMPORTANT: every existing call-site in this file was written against
-# sqlite3's "?" positional placeholders (q(sql, [params]), conn.execute(sql,
-# [params]), etc). Rather than rewrite every one of those call-sites for
-# Postgres/MySQL's different placeholder styles, get_conn()/q()/scalar()
-# below transparently convert "?" -> SQLAlchemy named binds, so ALL of the
-# app's business logic below this section is completely unchanged.
 @st.cache_resource(show_spinner=False)
 def _get_engine():
+    db_url = st.secrets.get("DB_URL", "sqlite:///textile_inventory.db")
+    
+    # اگر کلاؤڈ سرور پر لنک کے شروع میں postgres:// یا postgresql+psycopg2:// لکھا ہے،
+    # تو ہم اسے خودکار طور پر postgresql+pg8000:// میں بدل دیں گے تاکہ کوئی ایرر نہ آئے۔
+    if "postgresql+psycopg2://" in db_url:
+        db_url = db_url.replace("postgresql+psycopg2://", "postgresql+pg8000://")
+    elif db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+pg8000://", 1)
+    elif db_url.startswith("postgresql://") and not "+pg8000" in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+pg8000://", 1)
+        
+    return create_engine(db_url, pool_recycle=1800, pool_pre_ping=True)
+
+def get_conn():
+    return _get_engine().connect()
     db_url = st.secrets.get("DB_URL")
     if not db_url:
         st.error("⚠️ DB_URL is not configured in `.streamlit/secrets.toml`. "
