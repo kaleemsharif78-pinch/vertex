@@ -506,14 +506,19 @@ with top_c2:
 # per-user without breaking layout) but show a 🔒 access-denied message
 # instead of their real content.
 TAB_ACCESS = {
-    "🔍 Global Search":    ["Admin", "Data Entry"],
-    "➕ DC Entry":         ["Admin", "Data Entry"],
+    "🔍 Global Search":    ["Admin", "Data Entry", "CEO"],
+    "➕ DC Entry":         ["Admin", "Data Entry", "CEO"],
     "📋 All Entries":      ["Admin", "Data Entry"],
-    "📊 Master Ledger":    ["Admin", "Data Entry", "Viewer"],
+    "📊 Master Ledger":    ["Admin", "Data Entry", "Viewer", "CEO"],
     "📤 Sheet Upload":     ["Admin"],
-    "🚚 Bilty Management": ["Admin", "Data Entry"],
+    "🚚 Bilty Management": ["Admin", "Data Entry", "CEO"],
     "👤 User Management":  ["Admin"],
 }
+
+# Roles allowed to actually SAVE a new DC Entry (vs. just viewing the tab /
+# the live Bilty indicator). CEO can see everything in this tab but the
+# Save button is hidden for them — view-only, as requested.
+DC_ENTRY_WRITE_ROLES = ["Admin", "Data Entry"]
 
 def _access_ok(tab_label):
     if current_role not in TAB_ACCESS[tab_label]:
@@ -794,7 +799,10 @@ with tab2:
             bp4.markdown(f"<div class='kpi' style='background:#0f172a;color:{clr}'>{sign}<br><b>{after:+,}</b></div>", unsafe_allow_html=True)
 
         st.markdown("---")
-        if st.button("💾 Save Entry", type="primary", key="dc_save"):
+        if current_role not in DC_ENTRY_WRITE_ROLES:
+            st.info(f"🔒 Your role (**{current_role}**) has view-only access to DC Entry — you can see live stock/Bilty status above, "
+                    "but cannot add new entries. Contact an Admin or Data Entry user if a new DC needs to be recorded.")
+        elif st.button("💾 Save Entry", type="primary", key="dc_save"):
             s_dc   = str(f_dc).strip()
             s_po   = str(f_po).strip()
             s_coff = str(f_coff).strip()
@@ -1400,7 +1408,7 @@ with tab7:
                 nu_fullname = st.text_input("Full Name *")
             with nu_c2:
                 nu_password = st.text_input("Password *", type="password")
-                nu_role = st.selectbox("Role *", ["Admin", "Data Entry", "Viewer"])
+                nu_role = st.selectbox("Role *", ["Admin", "Data Entry", "Viewer", "CEO"])
             nu_submit = st.form_submit_button("➕ Create User", type="primary")
 
         if nu_submit:
