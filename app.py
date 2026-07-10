@@ -19,157 +19,158 @@ from sqlalchemy import create_engine, text, inspect
 @st.cache_resource(show_spinner=False)
 def _get_engine():
     db_url = st.secrets.get("DB_URL", "sqlite:///textile_inventory.db")
-    return create_engine(db_url, pool_pre_ping=True, pool_recycle=3600)
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+    return create_engine(db_url, pool_recycle=1800, pool_pre_ping=True)
 
 def get_conn():
-    engine = _get_engine()
-    return engine.connect()
+    return _get_engine().connect()
 
 def q(sql, params=None):
     if params is None:
         params = []
     engine = _get_engine()
-    compiled_sql = sql
-    bind_params = {}
-    for i, p in enumerate(params):
-        placeholder = f"p{i}"
-        compiled_sql = compiled_sql.replace("?", f":{placeholder}", 1)
-        bind_params[placeholder] = p
+    sql_clean = sql.replace("?", ":p")
+    bind_dict = {}
+    for i, val in enumerate(params):
+        bind_dict[f"p{i}"] = val
     with engine.connect() as conn:
-        res = conn.execute(text(compiled_sql), bind_params)
+        res = conn.execute(text(sql_clean), bind_dict)
         if res.returns_rows:
-            return pd.DataFrame(res.fetchall(), columns=res.keys())
-        return pd.DataFrame()
+            cols = res.keys()
+            rows = res.fetchall()
+            return pd.DataFrame([dict(zip(cols, r)) for r in rows])
+        else:
+            return pd.DataFrame()
+
+def q_exec(sql, params=None):
+    if params is None:
+        params = []
+    engine = _get_engine()
+    sql_clean = sql.replace("?", ":p")
+    bind_dict = {}
+    for i, val in enumerate(params):
+        bind_dict[f"p{i}"] = val
+    with engine.begin() as conn:
+        conn.execute(text(sql_clean), bind_dict)
 
 def scalar(sql, params=None):
     df = q(sql, params)
-    if not df.empty:
-        return df.iloc[0, 0]
-    return None
+    if df.empty:
+        return None
+    return df.iloc[0, 0]
 
 # ═══════════════════════════════════════════════
-# SYSTEM INITIALIZATION & DB SCHEMA
+# TABLES INITIALIZATION
 # ═══════════════════════════════════════════════
 def init_db():
     engine = _get_engine()
-    with engine.connect() as conn:
-        # Create core application tables if not exist
+    with engine.begin() as conn:
+        # Tables definitions as per working scheme
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS app_users (
-                username TEXT PRIMARY KEY,
-                password_hash TEXT,
-                full_name TEXT,
-                role TEXT,
-                created_at TEXT
+                username VARCHAR(100) PRIMARY KEY,
+                password_hash VARCHAR(255),
+                full_name VARCHAR(255),
+                role VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS sheet_orders (
                 id SERIAL PRIMARY KEY,
-                call_off_no TEXT,
-                sale_contract TEXT,
-                brand TEXT,
-                article TEXT,
-                category TEXT,
-                order_qty NUMERIC,
-                uploaded_at TEXT
+                call_off_no VARCHAR(100),
+                sale_contract VARCHAR(100),
+                brand VARCHAR(255),
+                article VARCHAR(255),
+                category VARCHAR(255),
+                order_qty DOUBLE PRECISION,
+                uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS inventory (
                 id SERIAL PRIMARY KEY,
-                dc_no TEXT,
-                dc_date TEXT,
-                gate_pass TEXT,
-                vehicle_no TEXT,
-                driver_name TEXT,
-                call_off_no TEXT,
-                article TEXT,
-                category TEXT,
-                qty NUMERIC,
+                date DATE,
+                dc_no VARCHAR(100),
+                gate_pass VARCHAR(100),
+                party VARCHAR(255),
+                brand VARCHAR(255),
+                call_off_no VARCHAR(100),
+                sale_contract VARCHAR(100),
+                article VARCHAR(255),
+                category VARCHAR(255),
+                qty DOUBLE PRECISION,
+                ctn DOUBLE PRECISION,
+                operator VARCHAR(100),
                 remarks TEXT,
-                operator TEXT,
-                created_at TEXT
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
         conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS bilty_records (
+            CREATE TABLE IF NOT EXISTS bilty_dispatches (
                 id SERIAL PRIMARY KEY,
-                bilty_no TEXT,
-                bilty_date TEXT,
-                transporter TEXT,
-                cartons NUMERIC,
-                weight NUMERIC,
-                destination TEXT,
-                dc_nos_linked TEXT,
+                date DATE,
+                bilty_no VARCHAR(100),
+                transporter VARCHAR(255),
+                brand VARCHAR(255),
+                call_off_no VARCHAR(100),
+                sale_contract VARCHAR(100),
+                article VARCHAR(255),
+                category VARCHAR(255),
+                qty DOUBLE PRECISION,
+                ctn DOUBLE PRECISION,
+                operator VARCHAR(100),
                 remarks TEXT,
-                operator TEXT,
-                created_at TEXT
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
+        # VISIT COUNTER & ACTIVE USERS SYSTEM
         conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS system_visits (
-                id SERIAL PRIMARY KEY,
-                visit_time TEXT
+            CREATE TABLE IF NOT EXISTS app_stats (
+                stat_key VARCHAR(100) PRIMARY KEY,
+                stat_value INT
             )
         """))
-        
-        # Verify default superuser account
-        chk = conn.execute(text("SELECT COUNT(*) FROM app_users WHERE username = :u"), {"u": "admin"}).scalar()
-        if chk == 0:
-            hp = hashlib.sha256("admin123".encode()).hexdigest()
-            conn.execute(text("""
-                INSERT INTO app_users (username, password_hash, full_name, role, created_at)
-                VALUES (:u, :hp, :fn, :r, :ca)
-            """), {"u": "admin", "hp": hp, "fn": "System Administrator", "r": "Admin", "ca": str(datetime.datetime.now())})
-        conn.commit()
+        # Initialize Visit Counter if not exists
+        conn.execute(text("""
+            INSERT INTO app_stats (stat_key, stat_value) 
+            VALUES ('visits', 0) 
+            ON CONFLICT (stat_key) DO NOTHING
+        """))
+        # Initialize default admin if not exists
+        c = conn.execute(text("SELECT COUNT(*) FROM app_users")).fetchone()[0]
+        if c == 0:
+            h = hashlib.sha256("admin123".encode()).hexdigest()
+            conn.execute(text("INSERT INTO app_users (username, password_hash, full_name, role) VALUES ('admin', :h, 'Admin Owner', 'Admin')"), {"h": h})
 
-init_db()
+# Run tables init safely
+try:
+    init_db()
+except Exception as e:
+    pass
 
 # ═══════════════════════════════════════════════
-# VISIT COUNTER LOGIC
+# VISIT COUNTER ENGINE
 # ═══════════════════════════════════════════════
 if "visited" not in st.session_state:
     st.session_state["visited"] = True
     try:
-        conn_v = get_conn()
-        conn_v.execute(text("INSERT INTO system_visits (visit_time) VALUES (:t)"), {"t": str(datetime.datetime.now())})
-        conn_v.commit()
-        conn_v.close()
-    except Exception:
+        q_exec("UPDATE app_stats SET stat_value = stat_value + 1 WHERE stat_key = 'visits'")
+    except:
         pass
 
-total_visits = scalar("SELECT COUNT(*) FROM system_visits") or 1
+total_visits = 0
+try:
+    total_visits = scalar("SELECT stat_value FROM app_stats WHERE stat_key = 'visits'")
+    if total_visits is None:
+        total_visits = 0
+except:
+    total_visits = 0
 
 # ═══════════════════════════════════════════════
-# APP CONFIGURATION & STYLING
+# CORE CONSTANTS
 # ═══════════════════════════════════════════════
-st.set_page_config(page_title="Vertex Packaging — Factory Panel", layout="wide", initial_sidebar_state="expanded")
-
-# Inject Custom Professional Layout CSS Styles
-st.markdown("""
-<style>
-    .reportview-container .main .block-container { max-width: 95%; padding-top: 1rem; }
-    .main-header { font-size:28px; font-weight:800; color:#1E3A8A; margin-bottom: 2px; text-transform: uppercase; letter-spacing: 1px; }
-    .sub-header { font-size:14px; color:#556B2F; margin-bottom: 18px; font-weight: 500; }
-    .sec { background-color: #F0F4F8; padding: 10px 14px; border-left: 5px solid #1E3A8A; font-weight: 700; font-size: 16px; color: #1E3A8A; margin-bottom: 15px; border-radius: 0 4px 4px 0; }
-    .kpi-row { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 15px; }
-    .kpi { flex: 1; min-width: 180px; padding: 12px 16px; border-radius: 8px; color: white; font-size: 14px; font-weight: 500; box-shadow: 0 2px 4px rgba(0,0,0,0.08); }
-    .kb { background: linear-gradient(135deg, #1E3A8A, #3B82F6); }
-    .kg { background: linear-gradient(135deg, #115E59, #14B8A6); }
-    .kr { background: linear-gradient(135deg, #9F1239, #F43F5E); }
-    .ka { background: linear-gradient(135deg, #B45309, #F59E0B); }
-    .kp { background: linear-gradient(135deg, #6B21A8, #A855F7); }
-    .ke { background: linear-gradient(135deg, #374151, #4B5563); }
-    .footer { position: fixed; left: 0; bottom: 0; width: 100%; background-color: #F8FAFC; color: #64748B; text-align: center; padding: 6px; font-size: 12px; font-weight: 600; border-top: 1px solid #E2E8F0; z-index: 100; }
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] { background-color: #F1F5F9; border: 1px solid #E2E8F0; padding: 8px 16px; border-radius: 6px 6px 0 0; font-weight: 600; color: #475569; }
-    .stTabs [data-baseweb="tab"]:hover { background-color: #E2E8F0; }
-    .stTabs [data-baseweb="tab"][aria-selected="true"] { background-color: #1E3A8A !important; color: white !important; border-color: #1E3A8A; }
-</style>
-""", unsafe_allow_html=True)
-
-# Global Configuration Parameters
 ITEM_TYPES = [
     "Inlay Card / Bandrolle",
     "Tag Card / Barcode Sticker",
@@ -180,355 +181,599 @@ ITEM_TYPES = [
     "Eco Friendly"
 ]
 
+# ═══════════════════════════════════════════════
+# MAIN PAGE BRANDING & STYLING
+# ═══════════════════════════════════════════════
+st.set_page_config(page_title="Vertex Packaging Portal", page_icon="🏭", layout="wide")
+
+# CUSTOM COLOR PALETTE
+st.markdown("""
+<style>
+    :root {
+        --primary: #0A2540;
+        --secondary: #639FAB;
+        --accent: #F2A900;
+        --bg: #F4F6F8;
+    }
+    .main-title {
+        text-align: center;
+        color: var(--primary);
+        font-family: 'Helvetica Neue', sans-serif;
+        font-weight: 800;
+        margin-bottom: 2px;
+        font-size: 2.8rem;
+    }
+    .sub-title {
+        text-align: center;
+        color: #555;
+        font-size: 1.1rem;
+        margin-bottom: 20px;
+    }
+    .trial-banner {
+        background-color: #FFF3CD;
+        border-left: 5px solid #FFC107;
+        color: #856404;
+        padding: 12px;
+        border-radius: 4px;
+        margin-bottom: 15px;
+        font-weight: bold;
+    }
+    .sec {
+        background-color: var(--primary);
+        color: white;
+        padding: 8px 15px;
+        border-radius: 4px;
+        font-weight: 600;
+        margin-top: 15px;
+        margin-bottom: 15px;
+    }
+    .kpi-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-bottom: 15px;
+    }
+    .kpi {
+        flex: 1;
+        min-width: 140px;
+        padding: 15px;
+        border-radius: 6px;
+        color: white;
+        text-align: center;
+        font-weight: bold;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .kb { background-color: #0F4C81; } /* Classic Blue */
+    .kg { background-color: #2D6A4F; } /* Forest Green */
+    .kr { background-color: #A63A50; } /* Crimson Red */
+    .ka { background-color: #E65F2B; } /* Orange Accent */
+    .kp { background-color: #6A0DAD; } /* Purple */
+    .ke { background-color: #1A936F; } /* Emerald Green */
+    
+    .footer {
+        text-align: center;
+        margin-top: 40px;
+        padding: 15px;
+        font-size: 11px;
+        color: #888;
+        border-top: 1px solid #E2E8F0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════
+# HELPER FUNCTIONS & EXPORTS
+# ═══════════════════════════════════════════════
 def round_bal(val):
-    if val is None: return 0
-    return int(math.floor(val)) if val >= 0 else int(math.ceil(val))
+    if val is None: return 0.0
+    r = round(val, 2)
+    return 0.0 if abs(r) < 0.01 else r
 
 def round_and_format(val):
     if val is None: return "0"
-    v = int(math.floor(val)) if val >= 0 else int(math.ceil(val))
-    return f"{v:,}"
+    r = round(val, 2)
+    if abs(r) < 0.01: return "0"
+    if r.is_integer():
+        return f"{int(r):,}"
+    return f"{r:,.2f}"
+
+def generate_ledger_pdf(item_summary, df_ledger, l_sel_coff, l_sel_cont, l_sel_art, report_type="MASTER"):
+    pdf_buffer = io.BytesIO()
+    doc = SimpleDocTemplate(pdf_buffer, pagesize=letter, rightMargin=20, leftMargin=20, topMargin=20, bottomMargin=20)
+    story = []
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'ReportTitle',
+        parent=styles['Heading1'],
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor('#0A2540'),
+        alignment=1,
+        spaceAfter=15
+    )
+    section_title_style = ParagraphStyle(
+        'SectionTitle',
+        parent=styles['Heading2'],
+        fontSize=12,
+        leading=16,
+        textColor=colors.HexColor('#0A2540'),
+        spaceBefore=10,
+        spaceAfter=5
+    )
+    meta_style = ParagraphStyle(
+        'MetaText',
+        parent=styles['Normal'],
+        fontSize=9,
+        leading=12,
+        textColor=colors.HexColor('#333333')
+    )
+    cell_style = ParagraphStyle(
+        'CellText',
+        parent=styles['Normal'],
+        fontSize=8,
+        leading=10
+    )
+    
+    # Title Block
+    title_text = "VERTEX PACKAGING — SYSTEM LEDGER"
+    if report_type == "SHORTAGE":
+        title_text = "VERTEX PACKAGING — PENDING SHORTAGE REPORT"
+    elif report_type == "CONTRACT_SHORTLIST":
+        title_text = "VERTEX PACKAGING — CONTRACT SHORTLIST STATEMENT"
+    story.append(Paragraph(title_text, title_style))
+    
+    # Metadata Row
+    metadata = f"<b>Date:</b> {datetime.datetime.now().strftime('%d-%b-%Y %I:%M %p')} | <b>Call-Off:</b> {l_sel_coff} | <b>Contract:</b> {l_sel_cont} | <b>Article:</b> {l_sel_art}"
+    story.append(Paragraph(metadata, meta_style))
+    story.append(Spacer(1, 10))
+    
+    # Summary of Item Types Pending
+    story.append(Paragraph("📌 ACCESSORIES REMAINING SUMMARY", section_title_style))
+    sum_data = [["Item Category", "Remaining Balance"]]
+    for item_type in ITEM_TYPES:
+        rem_val = item_summary.get(item_type, 0)
+        sum_data.append([item_type, round_and_format(rem_val)])
+        
+    t_sum = Table(sum_data, colWidths=[250, 150])
+    t_sum.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (1,0), colors.HexColor('#0A2540')),
+        ('TEXTCOLOR', (0,0), (1,0), colors.whitesmoke),
+        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+        ('BOTTOMPADDING', (0,0), (-1,0), 4),
+        ('TOPPADDING', (0,0), (-1,-1), 3),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,-1), 8),
+    ]))
+    story.append(t_sum)
+    story.append(Spacer(1, 15))
+    
+    # Detailed Data Grid
+    story.append(Paragraph("📋 DETAILED TRANSACTIONS SHEET", section_title_style))
+    grid_cols = ["Call-Off", "Contract", "Brand", "Article", "Item Category", "Ordered", "Received", "Remaining"]
+    grid_data = [grid_cols]
+    
+    for _, row in df_ledger.iterrows():
+        grid_data.append([
+            str(row["Call-Off No"]),
+            str(row["Contract #"]),
+            str(row["Brand"]),
+            str(row["Article"]),
+            str(row["Item Type"]),
+            round_and_format(row["Total Ordered"]),
+            round_and_format(row["Total Received"]),
+            round_and_format(row["Remaining Balance"])
+        ])
+        
+    t_grid = Table(grid_data, colWidths=[65, 65, 75, 75, 110, 60, 60, 60])
+    t_grid.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#639FAB')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+        ('ALIGN', (5,0), (-1,-1), 'RIGHT'),
+        ('TOPPADDING', (0,0), (-1,-1), 3),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,-1), 7),
+    ]))
+    story.append(t_grid)
+    
+    doc.build(story)
+    pdf_buffer.seek(0)
+    return pdf_buffer.getvalue()
 
 # ═══════════════════════════════════════════════
 # AUTHENTICATION ENGINE
 # ═══════════════════════════════════════════════
-if "auth_user" not in st.session_state:
-    st.session_state["auth_user"] = None
+if "logged_in_user" not in st.session_state:
+    st.session_state["logged_in_user"] = None
 
-def do_login(u, p):
-    hp = hashlib.sha256(p.encode()).hexdigest()
-    res = q("SELECT username, full_name, role FROM app_users WHERE username=? AND password_hash=?", [u, hp])
-    if not res.empty:
-        st.session_state["auth_user"] = {
-            "username": res.iloc[0]["username"],
-            "full_name": res.iloc[0]["full_name"],
-            "role": res.iloc[0]["role"]
-        }
-        return True
+def _get_active_display():
+    """ Returns active non-admin users for live display """
+    # Get active non-admin users if we tracked them
+    # For now, we can show currently logged in user role (if not admin)
+    curr = st.session_state["logged_in_user"]
+    if curr and curr["role"] != "Admin":
+        return f"👤 {curr['full_name']} ({curr['role']}) is Online"
+    return ""
+
+def _access_ok(tab_name):
+    u = st.session_state["logged_in_user"]
+    if not u: return False
+    role = u["role"]
+    if role == "Admin": return True
+    if role == "CEO": return True
+    # DC Operator Access Schema
+    if role == "DC Operator":
+        if tab_name in ["🚚 DC Inventory Gate-In", "📦 Bilty Dispatch Portal", "🔍 Global Search"]:
+            return True
     return False
 
-def do_logout():
-    st.session_state["auth_user"] = None
-    st.rerun()
+# HEADER AND BRANDING DISPLAYS
+st.markdown('<div class="main-title">🏭 Vertex Packaging Portal</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Production Logistics & Inventory Reconciliation | CEO: Shahzad Bhai</div>', unsafe_allow_html=True)
 
-current_user = st.session_state["auth_user"]
-
-# ═══════════════════════════════════════════════
-# ROLE-BASED ACCESS CONTROL
-# ═══════════════════════════════════════════════
-ROLE_PERMISSIONS = {
-    "Admin": ["🔍 Global Search", "📦 Inventory Ledger", "📝 DC Entry", "📊 Master Ledger", "📤 Upload Contracts", "🚛 Bilty Entry", "⚙️ User Management"],
-    "CEO": ["🔍 Global Search", "📦 Inventory Ledger", "📊 Master Ledger", "🚛 Bilty Entry"],
-    "DC Operator": ["🔍 Global Search", "📦 Inventory Ledger", "📝 DC Entry", "🚛 Bilty Entry"]
-}
-
-def _access_ok(module_name):
-    if not current_user: return False
-    perms = ROLE_PERMISSIONS.get(current_user["role"], [])
-    return module_name in perms
+# TRIAL BANNER ALWAYS VISIBLE
+st.markdown('<div class="trial-banner">⚠️ SYSTEM NOTICE: This system is currently running on a TRIAL BASIS (ٹرائل بیس) for testing and evaluation. All operations are monitored.</div>', unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════
-# PDF REPORT GENERATOR ENGINE
+# LOGIN SCREEN
 # ═══════════════════════════════════════════════
-def generate_ledger_pdf(global_summary, df_data, filter_coff, filter_cont, filter_art, report_type="MASTER"):
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter, rightMargin=20, leftMargin=20, topMargin=20, bottomMargin=30)
-    story = []
+if st.session_state["logged_in_user"] is None:
+    st.markdown('<div style="max-width: 450px; margin: 50px auto; padding: 30px; background: white; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">', unsafe_allow_html=True)
+    st.subheader("🔑 Security Login")
+    u_name = st.text_input("Username", key="login_u")
+    u_pass = st.text_input("Password", type="password", key="login_p")
     
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], fontSize=18, textColor=colors.HexColor('#1E3A8A'), spaceAfter=4, alignment=1)
-    meta_style = ParagraphStyle('MetaStyle', parent=styles['Normal'], fontSize=9, textColor=colors.HexColor('#475569'), alignment=1, spaceAfter=15)
-    section_title = ParagraphStyle('SecTitle', parent=styles['Heading2'], fontSize=11, textColor=colors.HexColor('#0F172A'), spaceBefore=8, spaceAfter=6)
-    cell_text = ParagraphStyle('CellText', parent=styles['Normal'], fontSize=8, textColor=colors.HexColor('#334155'))
-    cell_header = ParagraphStyle('CellHeader', parent=styles['Normal'], fontSize=8, fontName='Helvetica-Bold', textColor=colors.white)
-
-    # Header Titles
-    r_title = "MASTER INVENTORY LEDGER REPORT"
-    if report_type == "SHORTAGE":
-        r_title = "PENDING SHORTFALL & REMAINING MATERIAL REPORT"
-    elif report_type == "CONTRACT_SHORTLIST":
-        r_title = "CONTRACT-WISE RUNNING SHORTLIST"
-
-    story.append(Paragraph(f"<b>{r_title}</b>", title_style))
-    story.append(Paragraph(f"Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %I:%M %p')} | Scope Filters: CO={filter_coff}, Contract={filter_cont}, Article={filter_art}", meta_style))
-    
-    # Global Consolidated Box
-    story.append(Paragraph("<b>Consolidated Remaining Material Balances</b>", section_title))
-    sum_data = [[Paragraph("<b>Item Category</b>", cell_header), Paragraph("<b>Net Remaining Balance (Pcs)</b>", cell_header)]]
-    for k, v in global_summary.items():
-        sum_data.append([Paragraph(k, cell_text), Paragraph(round_and_format(v), cell_text)])
-    
-    sum_table = Table(sum_data, colWidths=[250, 150])
-    sum_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#1E3A8A')),
-        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#CBD5E1')),
-        ('TOPPADDING', (0,0), (-1,-1), 4),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
-        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.HexColor('#F8FAFC'), colors.white])
-    ]))
-    story.append(sum_table)
-    story.append(Spacer(1, 15))
-    
-    # Main Line Item Table Breakdowns
-    story.append(Paragraph("<b>Itemized Ledger Records Account Details</b>", section_title))
-    main_headers = ["Call-Off", "Contract", "Brand", "Article", "Item Category", "Ordered", "Received", "Remaining"]
-    main_data = [[Paragraph(f"<b>{h}</b>", cell_header) for h in main_headers]]
-    
-    for _, r in df_data.iterrows():
-        rem_v = r["Remaining Balance"]
-        rem_str = "" if (rem_v == 0 and report_type == "MASTER") else round_and_format(rem_v)
-        
-        main_data.append([
-            Paragraph(str(r["Call-Off No"]), cell_text),
-            Paragraph(str(r["Contract #"]), cell_text),
-            Paragraph(str(r["Brand"]), cell_text),
-            Paragraph(str(r["Article"]), cell_text),
-            Paragraph(str(r["Item Type"]), cell_text),
-            Paragraph(round_and_format(r["Total Ordered"]), cell_text),
-            Paragraph(round_and_format(r["Total Received"]), cell_text),
-            Paragraph(rem_str, cell_text)
-        ])
-        
-    main_table = Table(main_data, colWidths=[55, 60, 65, 75, 120, 60, 60, 65])
-    main_table.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#334155')),
-        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#E2E8F0')),
-        ('TOPPADDING', (0,0), (-1,-1), 3),
-        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.HexColor('#F1F5F9'), colors.white])
-    ]))
-    story.append(main_table)
-    
-    def add_footer(canvas, doc):
-        canvas.saveState()
-        canvas.setFont('Helvetica-Bold', 8)
-        canvas.setFillColor(colors.HexColor('#64748B'))
-        canvas.drawString(20, 15, "🏭 NABA TECH BY KALEEM ULLAH SHARIF  |  Customer: Vertex Packaging (CEO: Shahzad Bhai)")
-        canvas.drawRightString(letter[0]-20, 15, f"Page {doc.page}")
-        canvas.restoreState()
-
-    doc.build(story, onFirstPage=add_footer, onLaterPages=add_footer)
-    buf.seek(0)
-    return buf.getvalue()
-
-# ═══════════════════════════════════════════════
-# SCREEN INTERFACE ROUTER
-# ═══════════════════════════════════════════════
-if not current_user:
-    # Render Login Terminal Interface Window
-    st.markdown('<div class="main-header" style="text-align:center; margin-top:8%;">VERTEX PACKAGING</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header" style="text-align:center;">FACTORY INVENTORY CONTROL TERMINAL — TRIAL VERSION</div>', unsafe_allow_html=True)
-    
-    col1, col2, col3 = st.columns([1.5, 2, 1.5])
-    with col2:
-        with st.form("login_form", clear_on_submit=False):
-            st.markdown("##### 🔐 Secure Operational Sign-In")
-            u_input = st.text_input("Username", key="login_u")
-            p_input = st.text_input("Password", type="password", key="login_p")
-            sub_btn = st.form_submit_button("Authenticate Secure Session", use_container_width=True)
-            if sub_btn:
-                if do_login(u_input, p_input):
-                    st.success("Authorized. Initializing application data...")
-                    st.rerun()
-                else:
-                    st.error("Invalid credentials or unauthorized access protocol.")
+    if st.button("Access Dashboard", use_container_width=True):
+        phash = hashlib.sha256(u_pass.encode()).hexdigest()
+        user_row = q("SELECT username, password_hash, full_name, role FROM app_users WHERE username=? AND password_hash=?", [u_name, phash])
+        if not user_row.empty:
+            st.session_state["logged_in_user"] = {
+                "username": user_row.iloc[0]["username"],
+                "full_name": user_row.iloc[0]["full_name"],
+                "role": user_row.iloc[0]["role"]
+            }
+            st.success("Successfully Authenticated!")
+            st.rerun()
+        else:
+            st.error("Invalid credentials, please contact administrator.")
+    st.markdown('</div>', unsafe_allow_html=True)
     st.stop()
 
 # ═══════════════════════════════════════════════
-# APPLICATION HEADER & TOP RUNTIME ALERTS
+# MAIN INTERFACE (AFTER LOGIN)
 # ═══════════════════════════════════════════════
-st.warning("⚠️ **NOTICE:** This software platform is currently running on a **Trial Basis** for assessment and dry-testing operations.")
+current_user = st.session_state["logged_in_user"]
 
-# Dynamic User Activity Greeting Box (Hiding Admin, Showing Operators/CEO)
-user_display_string = ""
-if current_user["role"] != "Admin":
-    user_display_string = f"👤 **Active Session:** {current_user['full_name']} ({current_user['role']}) &nbsp;|&nbsp; "
+# TOP ROW BAR (LOGOUT, ACTIVE USERS, VISITOR COUNTER)
+col_head_left, col_head_mid, col_head_right = st.columns([6, 3, 3])
+with col_head_left:
+    st.markdown(f"Welcome back, **{current_user['full_name']}** ({current_user['role']})")
+with col_head_mid:
+    # Active Users (Hiding Admins completely)
+    active_disp = _get_active_display()
+    if active_disp:
+        st.markdown(f"<span style='color: #2D6A4F; font-weight: bold;'>{active_disp}</span>", unsafe_allow_html=True)
+with col_head_right:
+    # Visitor counter display & logout
+    st.markdown(f"<span style='float:right; font-weight:bold; color: #555;'>📈 Total Visits: {total_visits}</span>", unsafe_allow_html=True)
+    if st.button("🚪 Secure Sign-out", key="signout_btn"):
+        st.session_state["logged_in_user"] = None
+        st.rerun()
 
-st.markdown(f"""
-<div style="display:flex; justify-content:space-between; align-items:center; background:#F8FAFC; padding:10px 20px; border-radius:8px; border:1px solid #E2E8F0; margin-bottom:15px;">
-    <div>
-        <span style="font-size:24px; font-weight:800; color:#1E3A8A;">VERTEX PACKAGING</span><br>
-        <span style="font-size:12px; color:#556B2F; font-weight:600;">CEO: Shahzad Bhai &nbsp;|&nbsp; Total Platform Hits: {total_visits}</span>
-    </div>
-    <div style="font-size:13px; font-weight:600; color:#334155;">
-        {user_display_string}
-        <span style="color:#9F1239; cursor:pointer;">🔒 Secure Interface Active</span>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-
-if st.sidebar.button("🚪 Terminate Session (Logout)", key="global_logout_btn"):
-    do_logout()
-
-# Build Application Modular Navigation Tabs
-all_tabs = ["🔍 Global Search", "📦 Inventory Ledger", "📝 DC Entry", "📊 Master Ledger", "📤 Upload Contracts", "🚛 Bilty Entry", "⚙️ User Management"]
-active_tabs_names = [t for t in all_tabs if _access_ok(t)]
-ui_tabs = st.tabs(active_tabs_names)
-
-tab_map = {name: ui_tabs[i] for i, name in enumerate(active_tabs_names)}
+# CREATE SYSTEM TABS
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🔍 Global Search",
+    "📦 Bilty Dispatch Portal",
+    "🚚 DC Inventory Gate-In",
+    "📊 Master Ledger",
+    "📥 Contracts Upload",
+    "⚙️ System Controls"
+])
 
 # ═══════════════════════════════════════════════
-# FEATURE MODULE 1: GLOBAL SEARCH SYSTEM
+# TAB 1 — GLOBAL SEARCH SYSTEM
 # ═══════════════════════════════════════════════
-if "🔍 Global Search" in tab_map:
-    with tab_map["🔍 Global Search"]:
-        st.markdown('<div class="sec">🔍 Consolidated Engine Global Query Search</div>', unsafe_allow_html=True)
-        g_search = st.text_input("Enter Contract Number, Article Code, Bilty ID or DC Key:", key="g_search_input").strip()
+with tab1:
+    if _access_ok("🔍 Global Search"):
+        st.markdown('<div class="sec">🔍 Consolidated Global Search Engine</div>', unsafe_allow_html=True)
+        search_q = st.text_input("Enter Article No, Sales Contract #, DC No, or Token No to search:", key="g_search").strip()
         
-        if g_search:
-            st.markdown(f"#### 📡 Query Evaluation Matrix Analysis for: `{g_search}`")
+        if search_q:
+            st.markdown(f"### 🔍 Search Results for: `{search_q}`")
             
-            # Sub-Requirement A: Balance Type & Remaining Material Status
-            st.markdown("##### 📊 A. Material Allocation & Remaining Ledger Balances")
-            query_b = """
-                SELECT 
-                    so.sale_contract AS "Contract #", so.article AS "Article", so.category AS "Item Type",
-                    SUM(so.order_qty) AS "Ordered",
-                    COALESCE(inv.total_received, 0) AS "Received",
-                    SUM(so.order_qty) - COALESCE(inv.total_received, 0) AS "Remaining Balance"
-                FROM sheet_orders so
-                LEFT JOIN (
-                    SELECT call_off_no, article, category, SUM(qty) AS total_received FROM inventory GROUP BY call_off_no, article, category
-                ) inv ON so.call_off_no = inv.call_off_no AND so.article = inv.article AND so.category = inv.category
-                WHERE so.sale_contract LIKECASE ? OR so.article LIKECASE ?
-                GROUP BY so.sale_contract, so.article, so.category
-            """.replace("LIKECASE", "ILIKE" if "postgresql" in st.secrets.get("DB_URL", "") else "LIKE")
+            # CHECK INVENTORY ENTRIES
+            inv_res = q("""
+                SELECT date AS "Date", dc_no AS "DC No", gate_pass AS "Gate Pass", 
+                       party AS "Party", brand AS "Brand", call_off_no AS "Call-Off", 
+                       sale_contract AS "Contract #", article AS "Article", 
+                       category AS "Item Category", qty AS "Qty (Pcs)", ctn AS "Cartons", 
+                       operator AS "Operator", remarks AS "Remarks"
+                FROM inventory
+                WHERE article LIKE ? OR sale_contract LIKE ? OR dc_no LIKE ? OR gate_pass LIKE ?
+                ORDER BY created_at DESC
+            """, [f"%{search_q}%", f"%{search_q}%", f"%{search_q}%", f"%{search_q}%"])
             
-            df_b = q(query_b, [f"%{g_search}%", f"%{g_search}%"])
-            if not df_b.empty:
-                st.dataframe(df_b, use_container_width=True, hide_index=True)
-            else:
-                st.caption("No dynamic order balances matched for Contract or Article codes.")
-                
-            # Sub-Requirement B: Delivery Challan History Logs
-            st.markdown("##### 📝 B. Linked Delivery Challan (DC) Logs & Inward Receipts")
-            query_dc = """
-                SELECT dc_no AS "DC Number", dc_date AS "DC Date", call_off_no AS "Call-Off No", 
-                       article AS "Article", category AS "Item Category", qty AS "Quantity Received", 
-                       operator AS "Received By"
-                FROM inventory 
-                WHERE dc_no LIKECASE ? OR article LIKECASE ? OR call_off_no LIKECASE ?
-                ORDER BY dc_date DESC
-            """.replace("LIKECASE", "ILIKE" if "postgresql" in st.secrets.get("DB_URL", "") else "LIKE")
+            # CHECK BILTY ENTRIES
+            bilty_res = q("""
+                SELECT date AS "Date", bilty_no AS "Bilty No", transporter AS "Transporter", 
+                       brand AS "Brand", call_off_no AS "Call-Off", 
+                       sale_contract AS "Contract #", article AS "Article", 
+                       category AS "Item Category", qty AS "Qty (Pcs)", ctn AS "Cartons", 
+                       operator AS "Operator", remarks AS "Remarks"
+                FROM bilty_dispatches
+                WHERE article LIKE ? OR sale_contract LIKE ? OR bilty_no LIKE ?
+                ORDER BY created_at DESC
+            """, [f"%{search_q}%", f"%{search_q}%", f"%{search_q}%"])
             
-            df_dc = q(query_dc, [f"%{g_search}%", f"%{g_search}%", f"%{g_search}%"])
-            if not df_dc.empty:
-                st.dataframe(df_dc, use_container_width=True, hide_index=True)
-            else:
-                st.caption("No Delivery Challan entries tracked for this query.")
+            # ENHANCED GLOBAL SEARCH: SHOW REMAINING BALANCES & INTEGRATED HISTORIES IF ARTICLE/CONTRACT SEARCHED
+            # We check if search parameter matches some articles or contracts in orders
+            order_res = q("""
+                SELECT DISTINCT call_off_no, sale_contract, brand, article, category
+                FROM sheet_orders
+                WHERE article LIKE ? OR sale_contract LIKE ?
+            """, [f"%{search_q}%", f"%{search_q}%"])
 
-            # Sub-Requirement C: Linked Bilty Dispatches
-            st.markdown("##### 🚛 C. Outward Bilty Fleet Dispatches & Cargo Linking")
-            query_bl = """
-                SELECT bilty_no AS "Bilty No", bilty_date AS "Bilty Date", transporter AS "Transporter", 
-                       cartons AS "Cartons", destination AS "Destination", dc_nos_linked AS "Linked DCs"
-                FROM bilty_records
-                WHERE bilty_no LIKECASE ? OR dc_nos_linked LIKECASE ?
-                ORDER BY bilty_date DESC
-            """.replace("LIKECASE", "ILIKE" if "postgresql" in st.secrets.get("DB_URL", "") else "LIKE")
-            
-            df_bl = q(query_bl, [f"%{g_search}%", f"%{g_search}%"])
-            if not df_bl.empty:
-                st.dataframe(df_bl, use_container_width=True, hide_index=True)
-            else:
-                st.caption("No logistics outbound bilty dispatches bound to this specific query parameters.")
-
-# ═══════════════════════════════════════════════
-# FEATURE MODULE 2: INVENTORY LEDGER REGISTER
-# ═══════════════════════════════════════════════
-if "📦 Inventory Ledger" in tab_map:
-    with tab_map["📦 Inventory Ledger"]:
-        st.markdown('<div class="sec">📦 Raw Ledger Log Register View</div>', unsafe_allow_html=True)
-        df_inv = q("SELECT dc_no, dc_date, gate_pass, vehicle_no, driver_name, call_off_no, article, category, qty, remarks, operator, created_at FROM inventory ORDER BY id DESC")
-        if df_inv.empty:
-            st.info("No recorded material inward entries exist in database logs.")
-        else:
-            st.dataframe(df_inv, use_container_width=True, hide_index=True)
-
-# ═══════════════════════════════════════════════
-# FEATURE MODULE 3: DC ENTRY WIDGET ENGINE
-# ═══════════════════════════════════════════════
-if "📝 DC Entry" in tab_map:
-    with tab_map["📝 DC Entry"]:
-        st.markdown('<div class="sec">📝 Inward Delivery Challan Receipt Record System</div>', unsafe_allow_html=True)
-        
-        with st.form("dc_form", clear_on_submit=True):
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: f_dc = st.text_input("DC Number / Key", key="fdc")
-            with c2: f_dt = st.date_input("Challan Date", date.today(), key="fdt")
-            with c3: f_gp = st.text_input("Gate Pass Refer", key="fgp")
-            with c4: f_vh = st.text_input("Vehicle Plate Number", key="fvh")
-            
-            c5, c6 = st.columns(2)
-            with c5: f_dr = st.text_input("Driver Name Reference", key="fdr")
-            with c6: f_rm = st.text_input("Operational Remarks / Annotations", key="frm")
-            
-            st.markdown("---")
-            st.markdown("##### 📦 Line Item Processing Stream")
-            
-            df_ops = q("SELECT DISTINCT call_off_no FROM sheet_orders ORDER BY call_off_no DESC")
-            l_coff = df_ops["call_off_no"].tolist() if not df_ops.empty else []
-            
-            sel_coff = st.selectbox("Select Target Call-Off Contract", ["-- Select --"] + l_coff, key="dc_co_sel")
-            
-            l_art = []
-            if sel_coff != "-- Select --":
-                df_art = q("SELECT DISTINCT article FROM sheet_orders WHERE call_off_no=? ORDER BY article ASC", [sel_coff])
-                l_art = df_art["article"].tolist() if not df_art.empty else []
-                
-            sel_art = st.selectbox("Select Article Key Code", ["-- Select --"] + l_art, key="dc_art_sel")
-            
-            # Live Multi-Category Component Item Breakdown inside the Blue Box Container Style
-            if sel_coff != "-- Select --" and sel_art != "-- Select --":
-                st.markdown("""<div style='background-color:#EBF8FF; padding:12px; border-radius:8px; border-left:4px solid #3182CE; margin-bottom:15px;'>
-                    <h6 style='color:#2B6CB0; margin:0 0 8px 0; font-weight:700;'>💎 Current Accessories Status Summary (Selected Article)</h6>""", unsafe_allow_html=True)
-                
-                # Fetch contract vs current received values for this specific article
-                query_art_breakdown = """
-                    SELECT so.category, SUM(so.order_qty) AS ordered, COALESCE(inv.received, 0) AS received
+            if not order_res.empty:
+                st.markdown("#### ⏳ Consolidated Remaining Balance Statement (Ledger Tracker)")
+                bal_res = q("""
+                    SELECT
+                        so.call_off_no        AS "Call-Off No",
+                        so.sale_contract      AS "Contract #",
+                        so.brand              AS "Brand",
+                        so.article            AS "Article",
+                        so.category           AS "Item Type",
+                        SUM(so.order_qty)     AS "Total Ordered",
+                        COALESCE(inv.total_received, 0)                      AS "Total Received",
+                        SUM(so.order_qty) - COALESCE(inv.total_received, 0) AS "Remaining Balance"
                     FROM sheet_orders so
                     LEFT JOIN (
-                        SELECT call_off_no, article, category, SUM(qty) AS received FROM inventory GROUP BY call_off_no, article, category
-                    ) inv ON so.call_off_no = inv.call_off_no AND so.article = inv.article AND so.category = inv.category
-                    WHERE so.call_off_no = ? AND so.article = ?
-                    GROUP BY so.category
-                """
-                df_ab = q(query_art_breakdown, [sel_coff, sel_art])
-                if not df_ab.empty:
-                    cols_ab = st.columns(3)
-                    for idx, r_ab in df_ab.iterrows():
-                        rem_p = round_bal(r_ab["ordered"] - r_ab["received"])
-                        with cols_ab[idx % 3]:
-                            st.write(f"🔹 **{r_ab['category']}:** Balance Pcs: `{round_and_format(rem_p)}` (Rec: {round_and_format(r_ab['received'])})")
-                else:
-                    st.caption("No matching specification limits loaded.")
-                st.markdown("</div>", unsafe_allow_html=True)
-            
-            sel_cat = st.selectbox("Assign Inventory Material Group", ["-- Select --"] + ITEM_TYPES, key="dc_cat_sel")
-            f_qty = st.number_input("Inward Receipt Quantity Count (Pcs)", min_value=0, step=1, key="dc_qty_val")
-            
-            submit_dc = st.form_submit_button("Log Inward Receipt Transaction", type="primary")
-            if submit_dc:
-                if f_dc and sel_coff != "-- Select --" and sel_art != "-- Select --" and sel_cat != "-- Select --" and f_qty > 0:
-                    conn = get_conn()
-                    conn.execute(text("""
-                        INSERT INTO inventory (dc_no, dc_date, gate_pass, vehicle_no, driver_name, call_off_no, article, category, qty, remarks, operator, created_at)
-                        VALUES (:dc, :dt, :gp, :vh, :dr, :co, :ar, :ca, :qt, :rm, :op, :cr)
-                    """), {"dc": f_dc, "dt": str(f_dt), "gp": f_gp, "vh": f_vh, "dr": f_dr, "co": sel_coff, "ar": sel_art, "ca": sel_cat, "qt": f_qty, "rm": f_rm, "op": current_user["full_name"], "cr": str(datetime.datetime.now())})
-                    conn.commit()
-                    conn.close()
-                    st.success(f"✅ Inward Receipt Transaction Logged for DC {f_dc} successfully.")
-                    st.rerun()
-                else:
-                    st.error("Validation breakdown. Check parameters constraint limits fields.")
+                        SELECT call_off_no, article, category, SUM(qty) AS total_received
+                        FROM inventory
+                        GROUP BY call_off_no, article, category
+                    ) inv ON so.call_off_no = inv.call_off_no
+                          AND so.article    = inv.article
+                          AND so.category   = inv.category
+                    WHERE so.article LIKE ? OR so.sale_contract LIKE ?
+                    GROUP BY so.call_off_no, so.sale_contract, so.brand, so.article, so.category
+                    ORDER BY so.call_off_no DESC, so.article ASC
+                """, [f"%{search_q}%", f"%{search_q}%"])
+                
+                if not bal_res.empty:
+                    df_bal_fmt = bal_res.copy()
+                    df_bal_fmt["Total Ordered"] = df_bal_fmt["Total Ordered"].apply(round_and_format)
+                    df_bal_fmt["Total Received"] = df_bal_fmt["Total Received"].apply(round_and_format)
+                    df_bal_fmt["Remaining Balance"] = df_bal_fmt["Remaining Balance"].apply(lambda x: "" if x == 0 else round_and_format(x))
+                    st.dataframe(df_bal_fmt, use_container_width=True, hide_index=True)
+
+            # SHOW DC ENTRY HISTORY
+            st.markdown("#### 🚚 Gate-In / DC Entry History")
+            if not inv_res.empty:
+                st.dataframe(inv_res, use_container_width=True, hide_index=True)
+            else:
+                st.warning("No DC/Gate-In matching entries found.")
+                
+            # SHOW BILTY DISPATCH HISTORY
+            st.markdown("#### 📦 Bilty Dispatch History Linkage")
+            if not bilty_res.empty:
+                st.dataframe(bilty_res, use_container_width=True, hide_index=True)
+            else:
+                st.warning("No Bilty shipment matching records found.")
+
+    else:
+        st.warning("You do not have administrative privilege to view Tab 1.")
 
 # ═══════════════════════════════════════════════
-# FEATURE MODULE 4: DYNAMIC MASTER LEDGER REGISTER
+# TAB 2 — BILTY DISPATCH PORTAL (WITH MANUAL & TICK INPUTS)
 # ═══════════════════════════════════════════════
-if "📊 Master Ledger" in tab_map:
-    with tab_map["📊 Master Ledger"]:
+with tab2:
+    if _access_ok("📦 Bilty Dispatch Portal"):
+        st.markdown('<div class="sec">📦 Dispatch Loading Sheet & Bilty Generator</div>', unsafe_allow_html=True)
+        
+        # Dispatch Inputs Form
+        b_c1, b_c2, b_c3 = st.columns(3)
+        with b_c1:
+            b_date = st.date_input("Bilty Dispatch Date", value=date.today(), key="bilty_date")
+            b_no = st.text_input("Bilty / Tracking Number", key="bilty_no")
+        with b_c2:
+            b_trans = st.text_input("Transporter / Vehicle Detail", key="bilty_trans")
+            b_brand = st.selectbox("Select Brand", ["-- Select --"] + sorted(q("SELECT DISTINCT brand FROM sheet_orders")["brand"].tolist() if "brand" in q("SELECT DISTINCT brand FROM sheet_orders").columns else []), key="bilty_brand")
+        with b_c3:
+            b_coff = st.selectbox("Select Call-Off", ["-- Select --"] + sorted(q("SELECT DISTINCT call_off_no FROM sheet_orders")["call_off_no"].tolist() if "call_off_no" in q("SELECT DISTINCT call_off_no FROM sheet_orders").columns else []), key="bilty_coff")
+            b_contract = st.selectbox("Select Sales Contract", ["-- Select --"] + sorted(q("SELECT DISTINCT sale_contract FROM sheet_orders")["sale_contract"].tolist() if "sale_contract" in q("SELECT DISTINCT sale_contract FROM sheet_orders").columns else []), key="b_contract_sel")
+
+        # LOAD CONTRACT ITEMS FOR PROCESSING
+        if b_brand != "-- Select --" and b_coff != "-- Select --" and b_contract != "-- Select --":
+            b_orders = q("""
+                SELECT article, category, SUM(order_qty) AS ord_qty
+                FROM sheet_orders
+                WHERE brand=? AND call_off_no=? AND sale_contract=?
+                GROUP BY article, category
+            """, [b_brand, b_coff, b_contract])
+            
+            if not b_orders.empty:
+                st.markdown("##### 📦 Dispatch Articles & Quantities Setup")
+                st.info("Select items to dispatch. You can check the checkbox for total balance dispatch, OR input manual dispatch quantities directly. The system handles live +/- balance calculation on the fly.")
+                
+                dispatch_rows = []
+                for idx, row in b_orders.iterrows():
+                    art = row["article"]
+                    cat = row["category"]
+                    
+                    # Fetch already received and already dispatched to calculate available balance
+                    rec = scalar("SELECT SUM(qty) FROM inventory WHERE brand=? AND call_off_no=? AND sale_contract=? AND article=? AND category=?", [b_brand, b_coff, b_contract, art, cat]) or 0.0
+                    disp = scalar("SELECT SUM(qty) FROM bilty_dispatches WHERE brand=? AND call_off_no=? AND sale_contract=? AND article=? AND category=?", [b_brand, b_coff, b_contract, art, cat]) or 0.0
+                    avail_bal = max(0.0, rec - disp)
+                    
+                    # Layout row for input
+                    cols = st.columns([3, 3, 2, 2, 2])
+                    with cols[0]:
+                        st.markdown(f"**{art}** ({cat})")
+                    with cols[1]:
+                        st.caption(f"In Stock (Reconciled): {round_and_format(avail_bal)}")
+                    with cols[2]:
+                        # TICK OVERRIDE OPTION
+                        chk_all = st.checkbox("Ship All", key=f"bchk_{idx}")
+                    with cols[3]:
+                        # MANUAL INPUT OPTION next to tick option
+                        man_qty = st.number_input("Manual Qty", min_value=0.0, max_value=float(avail_bal), value=float(avail_bal) if chk_all else 0.0, step=1.0, key=f"bqty_{idx}")
+                    with cols[4]:
+                        man_ctn = st.number_input("Cartons", min_value=0.0, step=1.0, key=f"bctn_{idx}")
+                    
+                    # Calculate live remaining balance on page
+                    live_rem_bal = avail_bal - man_qty
+                    
+                    if man_qty > 0:
+                        dispatch_rows.append({
+                            "article": art,
+                            "category": cat,
+                            "qty": man_qty,
+                            "ctn": man_ctn,
+                            "rem_bal": live_rem_bal
+                        })
+                
+                b_remarks = st.text_area("Bilty Dispatch Comments / Shipment Notes", key="bilty_remarks")
+                
+                if st.button("💾 Record Dispatch shipment and print ledger", type="primary", key="save_bilty_btn"):
+                    if not b_no or not b_trans:
+                        st.error("Please fill in Bilty No and Transporter details.")
+                    elif len(dispatch_rows) == 0:
+                        st.error("Please select or enter manual quantities for at least one item to ship.")
+                    else:
+                        for item in dispatch_rows:
+                            q_exec("""
+                                INSERT INTO bilty_dispatches (date, bilty_no, transporter, brand, call_off_no, sale_contract, article, category, qty, ctn, operator, remarks)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, [b_date, b_no, b_trans, b_brand, b_coff, b_contract, item["article"], item["category"], item["qty"], item["ctn"], current_user["full_name"], b_remarks])
+                        st.success(f"✅ Bilty dispatch order '{b_no}' registered completely!")
+                        st.rerun()
+            else:
+                st.warning("No registered ordered quantities found matching this brand/call-off/contract criteria.")
+    else:
+        st.warning("Access Denied.")
+
+# ═══════════════════════════════════════════════
+# TAB 3 — DC INVENTORY GATE-IN (DYNAMIC CATEGORY BLUE BREAKDOWN)
+# ═══════════════════════════════════════════════
+with tab3:
+    if _access_ok("🚚 DC Inventory Gate-In"):
+        st.markdown('<div class="sec">🚚 Delivery Challan (DC) Gate-In Cargo Log</div>', unsafe_allow_html=True)
+        
+        # Form inputs
+        f_c1, f_c2, f_c3 = st.columns(3)
+        with f_c1:
+            g_date = st.date_input("Receive Date", value=date.today(), key="gate_date")
+            g_dc = st.text_input("DC Reference Number", key="gate_dc")
+            g_gp = st.text_input("Gate-Pass Code", key="gate_gp")
+        with f_c2:
+            g_party = st.text_input("Source Party / Vendor name", key="gate_party")
+            g_brand = st.selectbox("Select Brand Contract", ["-- Select --"] + sorted(q("SELECT DISTINCT brand FROM sheet_orders")["brand"].tolist() if "brand" in q("SELECT DISTINCT brand FROM sheet_orders").columns else []), key="gate_brand")
+        with f_c3:
+            g_coff = st.selectbox("Select Active Call-Off", ["-- Select --"] + sorted(q("SELECT DISTINCT call_off_no FROM sheet_orders")["call_off_no"].tolist() if "call_off_no" in q("SELECT DISTINCT call_off_no FROM sheet_orders").columns else []), key="gate_coff")
+            g_contract = st.selectbox("Select Sales Contract Order", ["-- Select --"] + sorted(q("SELECT DISTINCT sale_contract FROM sheet_orders")["sale_contract"].tolist() if "sale_contract" in q("SELECT DISTINCT sale_contract FROM sheet_orders").columns else []), key="gate_contract")
+
+        if g_brand != "-- Select --" and g_coff != "-- Select --" and g_contract != "-- Select --":
+            # Show list of Articles
+            art_list = sorted(q("SELECT DISTINCT article FROM sheet_orders WHERE brand=? AND call_off_no=? AND sale_contract=?", [g_brand, g_coff, g_contract])["article"].tolist() if "article" in q("SELECT DISTINCT article FROM sheet_orders WHERE brand=? AND call_off_no=? AND sale_contract=?", [g_brand, g_coff, g_contract]).columns else [])
+            g_article = st.selectbox("Select Target Article", ["-- Select --"] + art_list, key="gate_article")
+            
+            # DYNAMIC ITEM BREAKDOWN ON ARTICLE SELECT (BLUE COUNTERS INSIDE EXISTING COMPONENT BOX)
+            if g_article != "-- Select --":
+                st.markdown("""<style>
+                    .dynamic-blue-breakdown {
+                        background-color: #0F4C81 !important;
+                        color: white !important;
+                        padding: 18px;
+                        border-radius: 8px;
+                        margin-bottom: 20px;
+                        box-shadow: 0 4px 6px rgba(0,0,0,0.15);
+                    }
+                    .dynamic-blue-breakdown h4 {
+                        margin-top: 0;
+                        color: #FFF !important;
+                        border-bottom: 1px solid rgba(255,255,255,0.2);
+                        padding-bottom: 8px;
+                    }
+                    .item-grid {
+                        display: grid;
+                        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+                        gap: 12px;
+                        margin-top: 10px;
+                    }
+                    .item-badge {
+                        background: rgba(255, 255, 255, 0.15);
+                        padding: 8px;
+                        border-radius: 4px;
+                        text-align: center;
+                    }
+                </style>""", unsafe_allow_html=True)
+                
+                # Fetch balance details specifically for selected article categories
+                cat_data = q("""
+                    SELECT so.category, SUM(so.order_qty) AS ord_qty,
+                           COALESCE(inv.total_received, 0) AS total_received
+                    FROM sheet_orders so
+                    LEFT JOIN (
+                        SELECT call_off_no, article, category, SUM(qty) AS total_received
+                        FROM inventory
+                        GROUP BY call_off_no, article, category
+                    ) inv ON so.call_off_no = inv.call_off_no
+                          AND so.article    = inv.article
+                          AND so.category   = inv.category
+                    WHERE so.brand=? AND so.call_off_no=? AND so.sale_contract=? AND so.article=?
+                    GROUP BY so.category, inv.total_received
+                """, [g_brand, g_coff, g_contract, g_article])
+                
+                st.markdown('<div class="dynamic-blue-breakdown">', unsafe_allow_html=True)
+                st.markdown(f"<h4>📊 Item-Wise Live Breakdown for Article: {g_article}</h4>", unsafe_allow_html=True)
+                st.markdown('<div class="item-grid">', unsafe_allow_html=True)
+                
+                cat_summary = {}
+                for _, crow in cat_data.iterrows():
+                    cat_summary[crow["category"]] = crow["ord_qty"] - crow["total_received"]
+                
+                # Always show defined types
+                for itype in ITEM_TYPES:
+                    rem_qty_type = cat_summary.get(itype, 0.0)
+                    st.markdown(f"""
+                        <div class="item-badge">
+                            <span style="font-size:10px; display:block; opacity:0.8;">{itype}</span>
+                            <span style="font-size:14px; font-weight:bold;">{round_and_format(rem_qty_type)} Pcs</span>
+                        </div>
+                    """, unsafe_allow_html=True)
+                    
+                st.markdown('</div></div>', unsafe_allow_html=True)
+                
+                # Standard DC inputs for actual recording
+                g_category = st.selectbox("Select Accessory Type receiving", ITEM_TYPES, key="gate_cat")
+                g_qty = st.number_input("Received Qty (Pcs)", min_value=0.0, step=1.0, key="gate_qty")
+                g_ctn = st.number_input("Carton count", min_value=0.0, step=1.0, key="gate_ctn")
+                g_remarks = st.text_area("DC Entry Comments / Placement Details", key="gate_remarks")
+                
+                if st.button("📥 Commit DC Gate-In Entry", type="primary", key="save_dc_btn"):
+                    if not g_dc or not g_gp or not g_party:
+                        st.error("Please fill in DC, Gate-Pass, and Party Vendor details.")
+                    elif g_qty <= 0:
+                        st.error("Received quantity must be positive.")
+                    else:
+                        q_exec("""
+                            INSERT INTO inventory (date, dc_no, gate_pass, party, brand, call_off_no, sale_contract, article, category, qty, ctn, operator, remarks)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, [g_date, g_dc, g_gp, g_party, g_brand, g_coff, g_contract, g_article, g_category, g_qty, g_ctn, current_user["full_name"], g_remarks])
+                        st.success(f"✅ Challan {g_dc} committed successfully!")
+                        st.rerun()
+    else:
+        st.warning("Access Denied.")
+
+# ═══════════════════════════════════════════════
+# TAB 4 — MASTER LEDGER (UNCHANGED CORE ALIGNMENT)
+# ═══════════════════════════════════════════════
+with tab4:
+    if _access_ok("📊 Master Ledger"):
         st.markdown('<div class="sec">📊 Master Ledger (Order vs Delivery Status)</div>', unsafe_allow_html=True)
 
         query_ledger = """
@@ -695,244 +940,138 @@ if "📊 Master Ledger" in tab_map:
                 )
 
 # ═══════════════════════════════════════════════
-# FEATURE MODULE 5: CONTRACT SHEET UPLOADER ENGINE
+# TAB 5 — CONTRACTS SHEET UPLOAD
 # ═══════════════════════════════════════════════
-if "📤 Upload Contracts" in tab_map:
-    with tab_map["📤 Upload Contracts"]:
-        st.markdown('<div class="sec">📤 Upload Production Sales Order Contract Specification Sheet</div>', unsafe_allow_html=True)
-        st.info("💡 **Requirement Specification Format:** Upload an Excel workbook file containing `Call-Off No`, `Sale Contract`, `Brand`, `Article Code` and mapping category column headers.")
+with tab5:
+    if _access_ok("📥 Contracts Upload"):
+        st.markdown('<div class="sec">📥 Upload Brand/Customer Contract Order Sheets</div>', unsafe_allow_html=True)
+        st.info("Ensure files are standard .csv or Excel sheets with the columns: 'Call-Off No', 'Contract #', 'Brand', 'Article', 'Item Category', 'Qty'.")
         
-        up_file = st.file_uploader("Choose Sales Contract Specification Sheet (Excel format .xlsx)", type=["xlsx"])
+        up_file = st.file_uploader("Upload Sheet", type=["csv", "xlsx"], key="order_uploader")
         if up_file:
             try:
-                xls = pd.ExcelFile(up_file)
-                sh_names = xls.sheet_names
-                sel_sheet = st.selectbox("Select Target Specification Sheet Data Workspace Tab", sh_names)
-                
-                df_raw = pd.read_excel(up_file, sheet_name=sel_sheet)
-                st.markdown("##### 📁 Ingested Specification Stream Preview Raw Structure")
-                st.dataframe(df_raw.head(5), use_container_width=True)
-                
-                col_mapping = {}
-                headers = df_raw.columns.tolist()
-                
-                st.markdown("##### 🗺️ Map Workbook Headers into Core Platform Structure Keys")
-                mc1, mc2, mc3 = st.columns(3)
-                with mc1: col_mapping["co"] = st.selectbox("Call-Off No mapping", headers, index=headers.index("Call-Off No") if "Call-Off No" in headers else 0)
-                with mc2: col_mapping["sc"] = st.selectbox("Sale Contract mapping", headers, index=headers.index("Sale Contract") if "Sale Contract" in headers else 0)
-                with mc3: col_mapping["br"] = st.selectbox("Brand mapping", headers, index=headers.index("Brand") if "Brand" in headers else 0)
-                
-                mc4, mc5 = st.columns(2)
-                with mc4: col_mapping["ar"] = st.selectbox("Article Code mapping", headers, index=headers.index("Article Code") if "Article Code" in headers else 0)
-                with mc5: col_mapping["qty"] = st.selectbox("Order Quantity mapping", headers, index=headers.index("Order Qty") if "Order Qty" in headers else 0)
-                
-                st.markdown("---")
-                st.markdown("##### 🏷️ Specific Sub-Category Allocation Limits")
-                st.caption("Each row contains multiple accessory categories across different columns. Map each category to the matching column below:")
-                
-                for item_cat in ITEM_TYPES:
-                    default_idx = headers.index(item_cat) if item_cat in headers else 0
-                    col_mapping[f"cat_{item_cat}"] = st.selectbox(f"Column for '{item_cat}'", ["-- Skip Category --"] + headers, index=default_idx + 1 if item_cat in headers else 0)
-                
-                if st.button("🚀 Process & Ingest Specification Matrix into Database Registers", type="primary"):
-                    conn = get_conn()
-                    records_inserted = 0
+                if up_file.name.endswith(".csv"):
+                    df_up = pd.read_csv(up_file)
+                else:
+                    df_up = pd.read_excel(up_file)
                     
-                    for _, row in df_raw.iterrows():
-                        v_co = str(row[col_mapping["co"]]).strip()
-                        v_sc = str(row[col_mapping["sc"]]).strip()
-                        v_br = str(row[col_mapping["br"]]).strip()
-                        v_ar = str(row[col_mapping["ar"]]).strip()
-                        v_base_qty = pd.to_numeric(row[col_mapping["qty"]], errors='coerce')
-                        if pd.isna(v_base_qty): v_base_qty = 0
-                        
-                        if not v_co or v_co == "nan" or not v_ar or v_ar == "nan":
-                            continue
-                            
-                        for item_cat in ITEM_TYPES:
-                            map_col = col_mapping[f"cat_{item_cat}"]
-                            if map_col != "-- Skip Category --":
-                                raw_item_val = row[map_col]
-                                if pd.isna(raw_item_val) or str(raw_item_val).strip().lower() in ["nan", "", "-", "0"]:
-                                    continue
-                                
-                                final_qty = v_base_qty
-                                
-                                conn.execute(text("""
-                                    INSERT INTO sheet_orders (call_off_no, sale_contract, brand, article, category, order_qty, uploaded_at)
-                                    VALUES (:co, :sc, :br, :ar, :ca, :oq, :ua)
-                                """), {"co": v_co, "sc": v_sc, "br": v_br, "ar": v_ar, "ca": item_cat, "oq": final_qty, "ua": str(datetime.datetime.now())})
-                                records_inserted += 1
-                                
-                    conn.commit()
-                    conn.close()
-                    st.success(f"✅ Specification Data Stream Matrix Ingested. Successfully registered {records_inserted} discrete line nodes.")
+                st.dataframe(df_up.head(5), use_container_width=True)
+                
+                # Column mapper UI
+                cols_raw = df_up.columns.tolist()
+                st.markdown("##### Column Mappings")
+                mc1, mc2, mc3 = st.columns(3)
+                with mc1:
+                    m_coff = st.selectbox("Call-Off Column", cols_raw, index=0 if "Call-Off No" in cols_raw else 0, key="m_coff")
+                    m_cont = st.selectbox("Contract Column", cols_raw, index=cols_raw.index("Contract #") if "Contract #" in cols_raw else 0, key="m_cont")
+                with mc2:
+                    m_br = st.selectbox("Brand Column", cols_raw, index=cols_raw.index("Brand") if "Brand" in cols_raw else 0, key="m_br")
+                    m_art = st.selectbox("Article Column", cols_raw, index=cols_raw.index("Article") if "Article" in cols_raw else 0, key="m_art")
+                with mc3:
+                    m_cat = st.selectbox("Category Column", cols_raw, index=cols_raw.index("Item Category") if "Item Category" in cols_raw else 0, key="m_cat")
+                    m_qty = st.selectbox("Order Qty Column", cols_raw, index=cols_raw.index("Qty") if "Qty" in cols_raw else 0, key="m_qty")
+
+                if st.button("💾 Parse & Import Contract Data", type="primary", key="commit_import_btn"):
+                    total_imported = 0
+                    for _, row in df_up.iterrows():
+                        q_exec("""
+                            INSERT INTO sheet_orders (call_off_no, sale_contract, brand, article, category, order_qty)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, [
+                            str(row[m_coff]),
+                            str(row[m_cont]),
+                            str(row[m_br]),
+                            str(row[m_art]),
+                            str(row[m_cat]),
+                            float(row[m_qty])
+                        ])
+                        total_imported += 1
+                    st.success(f"✅ Successfully loaded {total_imported} contract entries into system databases!")
                     st.rerun()
             except Exception as e:
-                st.error(f"Failed parsing target Excel specification matrix workbook sheet file: {e}")
+                st.error(f"Error parsing document: {str(e)}")
+    else:
+        st.warning("Administrative privileges required to access Contract configuration upload.")
 
 # ═══════════════════════════════════════════════
-# FEATURE MODULE 6: BILTY LOGISTICS SYSTEM
+# TAB 6 — SYSTEM ADMIN CONTROLS
 # ═══════════════════════════════════════════════
-if "🚛 Bilty Entry" in tab_map:
-    with tab_map["🚛 Bilty Entry"]:
-        st.markdown('<div class="sec">🚛 Outward Fleet Logistics & Bilty Freight Ingest</div>', unsafe_allow_html=True)
+with tab6:
+    u = st.session_state["logged_in_user"]
+    if u and u["role"] == "Admin":
+        st.markdown('<div class="sec">⚙️ System Administrative Controls</div>', unsafe_allow_html=True)
         
-        # Dual Input Strategy: Option to select automated dispatch or manual overriding entries
-        processing_mode = st.radio("Processing Quantities Allocation Strategy Mode:", ["Standard Tick Selection Mode", "Manual Override Input Commentary Adjustment Mode"], horizontal=True)
-        
-        with st.form("bilty_form", clear_on_submit=True):
-            bc1, bc2, bc3 = st.columns(3)
-            with bc1: f_bilty = st.text_input("Bilty ID / Consignment Code", key="fbilty")
-            with bc2: f_bdate = st.date_input("Dispatch Departure Date", date.today(), key="fbdate")
-            with bc3: f_trans = st.text_input("Transporter / Logistics Carrier Name", key="ftrans")
-            
-            bc4, bc5, bc6 = st.columns(3)
-            with bc4: f_cartons = st.number_input("Total Dispatched Cartons Count", min_value=0, step=1, key="fcartons")
-            with bc5: f_weight = st.number_input("Gross Cargo Consignment Weight (Kgs)", min_value=0.0, step=0.1, key="fweight")
-            with bc6: f_dest = st.text_input("Destination Terminal Location City", key="fdest")
-            
-            st.markdown("---")
-            st.markdown("##### 🔗 Associate Unlinked Delivery Challans (DC) to Outbound Logistics Fleet Voyage")
-            
-            df_avail_dcs = q("SELECT DISTINCT dc_no, dc_date FROM inventory ORDER BY dc_no ASC")
-            
-            selected_dc_list = []
-            manual_commentary_adjustments = {}
-            
-            if df_avail_dcs.empty:
-                st.caption("No pending Delivery Challan receipts tracked to bind freight documentation.")
+        # Reset tables option
+        if st.checkbox("Show Destructive Commands (Danger)", key="sys_danger_chk"):
+            if st.button("⚠️ Wipe Database Tables (Except Users)", key="wipe_data_btn"):
+                q_exec("TRUNCATE TABLE inventory, bilty_dispatches, sheet_orders RESTART IDENTITY CASCADE")
+                st.warning("All inventory transactions and contract sheets successfully purged!")
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("##### 👥 Create System User Accounts")
+        nc1, nc2, nc3 = st.columns(3)
+        with nc1:
+            new_u = st.text_input("Username", key="nc_user")
+            new_f = st.text_input("Full Name", key="nc_fname")
+        with nc2:
+            new_p = st.text_input("Password", type="password", key="nc_pass")
+        with nc3:
+            new_r = st.selectbox("Security Role", ["DC Operator", "CEO", "Admin"], key="nc_role")
+
+        if st.button("➕ Generate User Account", key="create_user_btn"):
+            if not new_u or not new_p or not new_f:
+                st.error("Please provide all credential specs.")
             else:
-                for idx, r_dc in df_avail_dcs.iterrows():
-                    d_no = r_dc["dc_no"]
-                    d_dt = r_dc["dc_date"]
-                    
-                    cc1, cc2 = st.columns([1, 2])
-                    with cc1:
-                        is_ticked = st.checkbox(f"Challan No: {d_no} ({d_dt})", key=f"chk_dc_{d_no}")
-                        if is_ticked:
-                            selected_dc_list.append(d_no)
-                    with cc2:
-                        if processing_mode == "Manual Override Input Commentary Adjustment Mode":
-                            manual_val = st.text_input("Manual Commentary Quantity Override / Balance Weight Offset Adjust:", placeholder="Enter manual calculation offsets here...", key=f"txt_manual_{d_no}")
-                            if manual_val:
-                                manual_commentary_adjustments[d_no] = manual_val
-
-            st.markdown("---")
-            f_bremarks = st.text_input("Logistics Freight Manifest Special Remarks", key="fbremarks")
-            
-            submit_bilty = st.form_submit_button("Generate Outbound Bilty Dispatch Invoice Manifest", type="primary")
-            if submit_bilty:
-                if f_bilty and f_trans and selected_dc_list:
-                    dc_links_str = ", ".join(selected_dc_list)
-                    
-                    # If manual adjustment commentaries are passed, inject notes directly into the main remarks section securely
-                    final_remarks = f_bremarks
-                    if manual_commentary_adjustments:
-                        adjustment_summary = " | Manual Adjusts: " + "; ".join([f"DC {k}: {v}" for k, v in manual_commentary_adjustments.items()])
-                        final_remarks += adjustment_summary
-                        
-                    conn = get_conn()
-                    conn.execute(text("""
-                        INSERT INTO bilty_records (bilty_no, bilty_date, transporter, cartons, weight, destination, dc_nos_linked, remarks, operator, created_at)
-                        VALUES (:bn, :bd, :tr, :ct, :wt, :ds, :dl, :rm, :op, :cr)
-                    """), {"bn": f_bilty, "bd": str(f_bdate), "tr": f_trans, "ct": f_cartons, "wt": f_weight, "ds": f_dest, "dl": dc_links_str, "rm": final_remarks, "op": current_user["full_name"], "cr": str(datetime.datetime.now())})
-                    conn.commit()
-                    conn.close()
-                    st.success(f"✅ Logistics Freight Bilty Manifest {f_bilty} successfully registered.")
-                    st.rerun()
+                exists = scalar("SELECT COUNT(*) FROM app_users WHERE username=?", [new_u]) or 0
+                if exists > 0:
+                    st.error("Username already registered.")
                 else:
-                    st.error("Missing fields or missing bound delivery challans references.")
-                    
-        st.markdown("---")
-        st.markdown("##### 📜 Active Logistics Outbound Fleet manifest Log View")
-        df_b_logs = q("SELECT bilty_no, bilty_date, transporter, cartons, weight, destination, dc_nos_linked, remarks, operator FROM bilty_records ORDER BY id DESC")
-        if not df_b_logs.empty:
-            st.dataframe(df_b_logs, use_container_width=True, hide_index=True)
-
-# ═══════════════════════════════════════════════
-# FEATURE MODULE 7: SECURE USER TERMINAL CONTROL
-# ═══════════════════════════════════════════════
-if "⚙️ User Management" in tab_map:
-    with tab_map["⚙️ User Management"]:
-        st.markdown('<div class="sec">⚙️ Secure User Access Credentials Profile Configuration</div>', unsafe_allow_html=True)
-        
-        nu_col, rp_col = st.columns(2)
-        
-        with nu_col:
-            st.markdown("##### ➕ Provision New User Terminal Account Profile")
-            with st.form("new_user_form"):
-                new_user = st.text_input("Target Username Index ID", key="nu_user")
-                new_pass = st.text_input("Secure Profile Password Access Key", type="password", key="nu_pass")
-                new_name = st.text_input("Full Identity Human Name String", key="nu_name")
-                new_role = st.selectbox("Assign Access Privilege Authorization Protocol Level Role", ["DC Operator", "CEO", "Admin"], key="nu_role")
-                
-                submit_nu = st.form_submit_button("Provision Terminal Profile Account Nodes", type="primary")
-                if submit_nu:
-                    if new_user and new_pass and new_name:
-                        chk = scalar("SELECT COUNT(*) FROM app_users WHERE username=?", [new_user])
-                        if chk > 0:
-                            st.error("Account Profile username matches existing key constraint node entry.")
-                        else:
-                            hp = hashlib.sha256(new_pass.encode()).hexdigest()
-                            conn = get_conn()
-                            conn.execute(text("""
-                                INSERT INTO app_users (username, password_hash, full_name, role, created_at)
-                                VALUES (:u, :hp, :fn, :r, :ca)
-                            """), {"u": new_user, "hp": hp, "fn": new_name, "r": new_role, "ca": str(datetime.datetime.now())})
-                            conn.commit()
-                            conn.close()
-                            st.success(f"✅ Secure Account Entry registered successfully for context profile identifier '{new_user}'.")
-                            st.rerun()
-                    else:
-                        st.error("Parameters constraints parsing fields required check limits inputs parameters values.")
-
-        with rp_col:
-            st.markdown("##### 🔑 Override / Reset Terminal Authorization Access Passwords Keys")
-            df_all_u = q("SELECT username FROM app_users")
-            all_usernames = df_all_u["username"].tolist() if not df_all_u.empty else []
-            
-            with st.form("reset_pass_form"):
-                rp_user = st.selectbox("Select Target Profile Key Entity Node ID", all_usernames, key="rp_user_sel")
-                rp_newpass = st.text_input("Enter New Authorized Secret Credentials Key Pass", type="password", key="rp_newpass_val")
-                
-                submit_rp = st.form_submit_button("Override Credentials Profile Entry", type="secondary")
-                if submit_rp:
-                    if rp_user and rp_newpass:
-                        hp = hashlib.sha256(rp_newpass.encode()).hexdigest()
-                        conn = get_conn()
-                        conn.execute(text("UPDATE app_users SET password_hash=? WHERE username=?"), (hp, rp_user))
-                        conn.commit()
-                        conn.close()
-                        st.success(f"✅ Password reset for '{rp_user}'.")
+                    h = hashlib.sha256(new_p.encode()).hexdigest()
+                    q_exec("INSERT INTO app_users (username, password_hash, full_name, role) VALUES (?, ?, ?, ?)", [new_u, h, new_f, new_r])
+                    st.success(f"✅ User account '{new_u}' active!")
+                    st.rerun()
 
         st.markdown("---")
-        st.markdown("##### 📋 All Users")
+        st.markdown("##### 🔄 Reset User Passwords")
+        all_usernames = q("SELECT username FROM app_users")["username"].tolist() if "username" in q("SELECT username FROM app_users").columns else []
+        rp_user = st.selectbox("Select target account", ["-- Select --"] + all_usernames, key="rp_user_sel")
+        if rp_user != "-- Select --":
+            rp_newpass = st.text_input("Enter New Password", type="password", key="rp_pass_inp")
+            if st.button("💾 Apply Password Override", key="rp_btn_commit"):
+                if not rp_newpass:
+                    st.error("Provide a valid password.")
+                else:
+                    nh = hashlib.sha256(rp_newpass.encode()).hexdigest()
+                    q_exec("UPDATE app_users SET password_hash=? WHERE username=?", [nh, rp_user])
+                    st.success(f"✅ Password reset complete for '{rp_user}'.")
+
+        st.markdown("---")
+        st.markdown("##### 📋 Live Registered Users Sheet")
         df_users = q("SELECT username AS Username, full_name AS \"Full Name\", role AS Role, created_at AS \"Created At\" FROM app_users ORDER BY username")
         st.dataframe(df_users, use_container_width=True, hide_index=True)
 
-        st.markdown("##### 🗑️ Delete a User")
-        del_candidates = [u for u in all_usernames if u != current_user["username"]]
+        st.markdown("##### 🗑️ Remove User Account")
+        del_candidates = [usr for usr in all_usernames if usr != current_user["username"]]
         if del_candidates:
-            del_user = st.selectbox("Select user to delete", ["-- Select --"] + del_candidates, key="del_user_sel")
+            del_user = st.selectbox("Select user to purge", ["-- Select --"] + del_candidates, key="del_user_sel")
             if del_user != "-- Select --":
-                if st.checkbox(f"Confirm delete '{del_user}'", key="del_user_chk"):
-                    if st.button("🗑️ Delete User", key="del_user_btn"):
-                        conn = get_conn()
-                        conn.execute(text("DELETE FROM app_users WHERE username=:u"), {"u": del_user})
-                        conn.commit()
-                        conn.close()
-                        st.success(f"✅ User '{del_user}' deleted.")
+                if st.checkbox(f"Confirm completely delete '{del_user}' account", key="del_user_chk"):
+                    if st.button("🗑️ Delete User Account", key="del_user_btn"):
+                        q_exec("DELETE FROM app_users WHERE username=?", [del_user])
+                        st.success(f"✅ User account '{del_user}' removed.")
                         st.rerun()
         else:
-            st.caption("No other users to delete.")
+            st.caption("No eligible user accounts for disposal.")
+    else:
+        st.warning("Only Owner Administrator can view System Administrative Settings Panel.")
 
 # ═══════════════════════════════════════════════
-# FOOTER TECHNICAL SIGNATURE TRADEMARK METRIC
+# MAIN SYSTEM FOOTER (KEEPING NABA TECH SPEC)
 # ═══════════════════════════════════════════════
 st.markdown("""
 <div class="footer">
   🏭 NABA TECH BY KALEEM ULLAH SHARIF &nbsp;|&nbsp;
-  Customer: Vertex Packaging (CEO: Shahzad Bhai)
+  Customer: Vertex Packaging (Shahzad Bhai) Lahore
 </div>
 """, unsafe_allow_html=True)
