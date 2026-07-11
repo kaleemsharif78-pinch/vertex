@@ -20,8 +20,6 @@ from sqlalchemy import create_engine, text, inspect
 def _get_engine():
     db_url = st.secrets.get("DB_URL", "sqlite:///textile_inventory.db")
     
-    # اگر کلاؤڈ سرور پر لنک کے شروع میں postgres:// یا postgresql+psycopg2:// لکھا ہے،
-    # تو ہم اسے خودکار طور پر postgresql+pg8000:// میں بدل دیں گے تاکہ کوئی ایرر نہ آئے۔
     if "postgresql+psycopg2://" in db_url:
         db_url = db_url.replace("postgresql+psycopg2://", "postgresql+pg8000://")
     elif db_url.startswith("postgres://"):
@@ -30,25 +28,6 @@ def _get_engine():
         db_url = db_url.replace("postgresql://", "postgresql+pg8000://", 1)
         
     return create_engine(db_url, pool_recycle=1800, pool_pre_ping=True)
-
-def get_conn():
-    return _get_engine().connect()
-    db_url = st.secrets.get("DB_URL")
-    if not db_url:
-        st.error("⚠️ DB_URL is not configured in `.streamlit/secrets.toml`. "
-                 "Add e.g. DB_URL = \"postgresql+psycopg2://user:pass@host:5432/dbname\" and restart.")
-        st.stop()
-    # PERFORMANCE: keep a small pool of already-open connections ready to
-    # reuse instead of opening a brand-new TCP+SSL connection to the remote
-    # DB for every single query (each of those round-trips is the real cost
-    # once you're on a remote Postgres, especially cross-region).
-    return create_engine(
-        db_url,
-        pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=10,
-        pool_recycle=300,
-    )
 
 def _qmark_to_named(sql, params):
     """Converts sqlite-style '?' placeholders + a positional params list into
@@ -81,7 +60,7 @@ class _CompatConn:
 @st.cache_resource(show_spinner=False)
 def _init_schema():
     engine = _get_engine()
-    dialect = engine.dialect.name  # 'postgresql', 'mysql', or 'sqlite' (local dry-test only)
+    dialect = engine.dialect.name
     if dialect == "postgresql":
         pk = "SERIAL PRIMARY KEY"
     elif dialect == "mysql":
@@ -89,7 +68,7 @@ def _init_schema():
     else:
         pk = "INTEGER PRIMARY KEY AUTOINCREMENT"
 
-    # PHASE 1 — tables. Its own transaction.
+    # PHASE 1 — tables.
     with engine.begin() as conn:
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS sheet_orders (
@@ -109,15 +88,13 @@ def _init_schema():
                 call_off_no TEXT, contract_no TEXT, article TEXT, category TEXT,
                 qty REAL, cartons INTEGER, transport_mode TEXT,
                 bilty_date TEXT, created_at TEXT)"""))
-        # NEW: multi-user login + role-based access control
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS app_users (
                 id {pk},
                 username TEXT UNIQUE, password_hash TEXT, role TEXT,
                 full_name TEXT, created_at TEXT)"""))
 
-    # PHASE 2 — column migration. Its own transaction, only runs at all if
-    # something is actually missing (cuts a round-trip on every normal boot).
+    # PHASE 2 — column migration.
     insp = inspect(engine)
     inv_cols = [c["name"] for c in insp.get_columns("inventory")]
     missing_cols = [c for c in ["entry_date", "remark", "company_token", "contract_no", "style_type"] if c not in inv_cols]
@@ -126,8 +103,6 @@ def _init_schema():
             for col in missing_cols:
                 conn.execute(text(f"ALTER TABLE inventory ADD COLUMN {col} TEXT DEFAULT ''"))
 
-    # NEW ADDITION: last_seen column on app_users, powers the Active Users
-    # display. Same isolated-migration pattern as above.
     au_cols = [c["name"] for c in insp.get_columns("app_users")]
     missing_au_cols = [c for c in ["last_seen"] if c not in au_cols]
     if missing_au_cols:
@@ -135,18 +110,7 @@ def _init_schema():
             for col in missing_au_cols:
                 conn.execute(text(f"ALTER TABLE app_users ADD COLUMN {col} TEXT DEFAULT ''"))
 
-    # PHASE 3 — indexes. BUGFIX: these used to run in the SAME transaction as
-    # everything else, wrapped in a per-statement try/except. On PostgreSQL,
-    # one failed statement (e.g. index already exists) poisons the WHOLE
-    # transaction — every statement after it (including admin-seeding below)
-    # then also fails, even though the Python try/except silently swallowed
-    # it. Since _init_schema() then raised, st.cache_resource never cached a
-    # successful run, so this entire setup was silently re-running on every
-    # single page load. Fixed by:
-    #  - Using "CREATE INDEX IF NOT EXISTS" directly on Postgres/SQLite (one
-    #    idempotent round-trip each, no separate existence-check needed).
-    #  - Giving each statement its OWN transaction on MySQL (which lacks
-    #    IF NOT EXISTS for indexes), so one failure can't cascade.
+    # PHASE 3 — indexes.
     index_defs = [
         ("idx_inv_article_category", "inventory(article, category)"),
         ("idx_inv_calloff",          "inventory(call_off_no)"),
@@ -168,14 +132,13 @@ def _init_schema():
                 with engine.begin() as conn:
                     conn.execute(text(f"CREATE INDEX {name} ON {target}"))
             except Exception:
-                pass  # already exists — isolated transaction, doesn't affect the others
+                pass
     else:
         with engine.begin() as conn:
             for name, target in index_defs:
                 conn.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {target}"))
 
-    # PHASE 4 — default admin seed. Its own transaction, guaranteed to run
-    # regardless of what happened with indexes above.
+    # PHASE 4 — default admin seed.
     with engine.begin() as conn:
         user_count = conn.execute(text("SELECT COUNT(*) FROM app_users")).scalar()
         if not user_count:
@@ -185,8 +148,7 @@ def _init_schema():
                 {"u": "admin", "p": _hash_password("admin123"), "r": "Admin",
                  "f": "Default Admin", "c": str(datetime.datetime.now())})
 
-    # PHASE 5 — NEW ADDITION: site_stats table for the Visit Counter. Own
-    # transaction, seeds the 'total_visits' row once if missing.
+    # PHASE 5 — site_stats table for Visit Counter.
     with engine.begin() as conn:
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS site_stats (
@@ -198,7 +160,7 @@ def _init_schema():
     return True
 
 def get_conn():
-    _init_schema()  # cached no-op after the first call this session
+    _init_schema()
     engine = _get_engine()
     return _CompatConn(engine.connect())
 
@@ -216,7 +178,7 @@ def _verify_password(password, stored_hash):
 
 
 # ─────────────────────────────────────────────
-# CONSTANTS
+# CONSTANTS & HELPERS
 # ─────────────────────────────────────────────
 ITEM_TYPES = [
     "Inlay Card / Bandrolle", 
@@ -230,9 +192,6 @@ ITEM_TYPES = [
 
 STYLES_INLAY = ["Normal", "Topper", "Split"]
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
 def q(sql, params=None):
     named_sql, pdict = _qmark_to_named(sql, params or [])
     engine = _get_engine()
@@ -264,8 +223,6 @@ def get_received_qty(article, category, coff=None, po=None, exclude_id=None):
     return scalar(f"SELECT SUM(qty) FROM inventory WHERE article=? AND category=?{extra}", params)
 
 def get_bilty_qty(call_off_no, article, category=None):
-    """Total quantity already dispatched (Bilty) from the Lahore factory for
-    this Call-Off + Article (optionally scoped to one category)."""
     params, extra = [call_off_no, article], ""
     if category:
         extra = " AND category=?"; params.append(category)
@@ -283,8 +240,6 @@ def round_and_format(val):
         return "0"
 
 def round_bal(val):
-    """Strict zero-balancing helper: rounds away Python float micro-garbage
-    (e.g. 0.00001 / -0.00001) so true-zero rows are correctly detected."""
     try:
         if pd.isna(val) or val == "" or val == "—":
             return 0
@@ -348,9 +303,6 @@ def generate_ledger_pdf(df_summary, df_articles, sel_coff, sel_cont, sel_art, re
     sec2_title = "<b>🔍 SECTION 2: PENDING ARTICLES BREAKDOWN (SHORTAGE LIST)</b>" if report_type in ("SHORTAGE", "CONTRACT_SHORTLIST") else "<b>🔍 SECTION 2: ARTICLES COMPLETE BREAKDOWN</b>"
     story.append(Paragraph(sec2_title, h2_style))
 
-    # Remarks column: only for Shortage / Contract Shortlist reports, showing
-    # the manual remarks typed by the operator during DC entry for that
-    # exact Call-Off + Article + Item Type combination.
     show_remarks = report_type in ("SHORTAGE", "CONTRACT_SHORTLIST")
     remarks_map = {}
     if show_remarks:
@@ -396,7 +348,7 @@ def generate_ledger_pdf(df_summary, df_articles, sel_coff, sel_cont, sel_art, re
     story.append(t_art)
     story.append(Spacer(1, 25))
     
-    sig_data = [["-------------------------\nReport Checked By\n(NABA Packaging Team)", "-------------------------\nAuthorized Signature\n(Kaleem Ullah Sharif)"]]
+    sig_data = [["-------------------------\nReport Checked By\n(NABA Packaging Team)", "-------------------------\nAuthorized Signature\n(領隊 / D.C. Kaleem Ullah Sharif)"]]
     t_sig = Table(sig_data, colWidths=[250, 250])
     t_sig.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER'), ('FONTSIZE', (0,0), (-1,-1), 9)]))
     story.append(t_sig)
@@ -449,26 +401,11 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# BUGFIX: _init_schema() (creates tables + seeds the default admin account)
-# used to only run lazily inside get_conn(). The login form below only calls
-# q(), which never triggered it — so after a fresh reboot, a login attempt
-# could run before the admin account was (re)seeded, wrongly showing
-# "Invalid username or password" even on a correct first login. Calling it
-# explicitly here guarantees schema + seeding always exist before anything
-# else runs. st.cache_resource makes this a cheap no-op after the first call.
 _init_schema()
 
-# ═══════════════════════════════════════════════
-# NEW ADDITION: Trial Version Notice (pure addition, no layout/CSS changed)
-# ═══════════════════════════════════════════════
 st.warning("⚠️ **Trial Version Notice:** This system is currently running on a **Trial Basis** for testing purposes. "
            "یہ نظام فی الحال ٹیسٹنگ کے مقاصد کے لیے ٹرائل بیس پر چل رہا ہے۔")
 
-# ═══════════════════════════════════════════════
-# NEW ADDITION: Website Visit Counter — counts once per new browser session
-# (not on every rerun/click), stored in the site_stats table. Shown even
-# before login, since a "visit" happens as soon as the page loads.
-# ═══════════════════════════════════════════════
 if "visit_counted" not in st.session_state:
     _vc_conn = get_conn()
     _vc_conn.execute("UPDATE site_stats SET stat_value = stat_value + 1 WHERE stat_key='total_visits'")
@@ -480,7 +417,7 @@ _total_visits = scalar("SELECT stat_value FROM site_stats WHERE stat_key='total_
 st.caption(f"👁️ Total Visits: {int(_total_visits):,}")
 
 # ═══════════════════════════════════════════════
-# AUTHENTICATION & ROLE-BASED ACCESS CONTROL (NEW — Cloud version only)
+# AUTHENTICATION
 # ═══════════════════════════════════════════════
 if "auth_user" not in st.session_state:
     st.session_state["auth_user"] = None
@@ -502,17 +439,12 @@ if st.session_state["auth_user"] is None:
             st.rerun()
         else:
             st.error("❌ Invalid username or password.")
-    st.info("First time setup? Default login is **admin / admin123** — please change it immediately "
-            "from the 👤 User Management tab after logging in.")
+    st.info("First time setup? Default login is **admin / admin123** — please change it immediately from the 👤 User Management tab after logging in.")
     st.stop()
 
 current_user = st.session_state["auth_user"]
 current_role = current_user["role"]
 
-# NEW ADDITION: update this user's last_seen timestamp on every rerun, and
-# build the Active Users list. Admins are ALWAYS excluded from this list —
-# per the strict requirement, nobody (including other viewers) should be
-# able to tell an Admin is online.
 _now_ts = str(datetime.datetime.now())
 _conn_ls = get_conn()
 _conn_ls.execute("UPDATE app_users SET last_seen=? WHERE username=?", (_now_ts, current_user["username"]))
@@ -520,8 +452,7 @@ _conn_ls.commit()
 _conn_ls.close()
 
 _ACTIVE_WINDOW_MINUTES = 5
-_df_active = q("SELECT username, role, full_name, last_seen FROM app_users "
-               "WHERE last_seen IS NOT NULL AND last_seen != '' AND role != 'Admin'")
+_df_active = q("SELECT username, role, full_name, last_seen FROM app_users WHERE last_seen IS NOT NULL AND last_seen != '' AND role != 'Admin'")
 _active_list = []
 _now_dt = datetime.datetime.now()
 for _, _r in _df_active.iterrows():
@@ -542,10 +473,6 @@ with top_c2:
         st.session_state["auth_user"] = None
         st.rerun()
 
-# Role → allowed tab labels. Tabs the current role can't access still render
-# in the tab bar (Streamlit limitation: tabs can't be created conditionally
-# per-user without breaking layout) but show a 🔒 access-denied message
-# instead of their real content.
 TAB_ACCESS = {
     "🔍 Global Search":    ["Admin", "Data Entry", "CEO"],
     "➕ DC Entry":         ["Admin", "Data Entry", "CEO"],
@@ -556,9 +483,6 @@ TAB_ACCESS = {
     "👤 User Management":  ["Admin"],
 }
 
-# Roles allowed to actually SAVE a new DC Entry (vs. just viewing the tab /
-# the live Bilty indicator). CEO can see everything in this tab but the
-# Save button is hidden for them — view-only, as requested.
 DC_ENTRY_WRITE_ROLES = ["Admin", "Data Entry"]
 
 def _access_ok(tab_label):
@@ -576,7 +500,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 ])
 
 # ═══════════════════════════════════════════════
-# TAB 1 — GLOBAL SEARCH (UNCHANGED)
+# TAB 1 — GLOBAL SEARCH
 # ═══════════════════════════════════════════════
 with tab1:
     if _access_ok("🔍 Global Search"):
@@ -585,10 +509,6 @@ with tab1:
 
         if gs and len(gs.strip()) >= 2:
             gq = f"%{gs.strip()}%"
-            # PERFORMANCE: these used to be 6 separate round-trips to the DB
-            # on every keystroke. Combined into 1 query (each branch wrapped
-            # as its own subquery so per-branch LIMIT works portably on
-            # SQLite, PostgreSQL and MySQL alike).
             sug_sql = """
                 SELECT * FROM (SELECT 'PO No.'    AS t, po_no          AS val FROM sheet_orders WHERE po_no LIKE ? AND TRIM(po_no)!='' LIMIT 4) x1
                 UNION ALL
@@ -646,8 +566,7 @@ with tab1:
 
             if not df_ord.empty:
                 df_it = df_ord.groupby("category")["ordered"].sum().reset_index()
-                df_ir = df_inv.groupby("category")["qty"].sum().reset_index() if not df_inv.empty \
-                        else pd.DataFrame(columns=["category","qty"])
+                df_ir = df_inv.groupby("category")["qty"].sum().reset_index() if not df_inv.empty else pd.DataFrame(columns=["category","qty"])
                 df_it = df_it.merge(df_ir, on="category", how="left")
                 df_it["qty"]     = df_it["qty"].fillna(0)
                 df_it["Balance"] = df_it["ordered"] - df_it["qty"]
@@ -668,12 +587,6 @@ with tab1:
             else:
                 st.info("No DC entries found.")
 
-            # ═══════════════════════════════════════════════
-            # NEW ADDITION: Bilty Linkage — pure addition, does not alter any
-            # existing search logic above. Shows Bilty (Lahore→Karachi dispatch)
-            # records matching the same Call-Off / Contract / Article search term,
-            # so a Contract # or Article search also surfaces its dispatch history.
-            # ═══════════════════════════════════════════════
             df_bilty_search = q("""
                 SELECT bilty_date AS "Date", call_off_no AS "Call-Off", contract_no AS "Contract #",
                        article AS "Article", category AS "Item Type", qty AS "Qty",
@@ -692,12 +605,11 @@ with tab1:
                 st.rerun()
 
 # ═══════════════════════════════════════════════
-# TAB 2 — DC ENTRY (UNCHANGED)
+# TAB 2 — DC ENTRY
 # ═══════════════════════════════════════════════
 with tab2:
     if _access_ok("➕ DC Entry"):
         st.markdown('<div class="sec">➕ New DC Entry — Call-Off Triggered Auto-Load</div>', unsafe_allow_html=True)
-    
         dc_main_cols = st.columns([3, 2])
     
         with dc_main_cols[0]:
@@ -749,7 +661,6 @@ with tab2:
                         "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND TRIM(po_no)!='' ORDER BY po_no",
                         [f_coff]).fetchall()
                     po_for_sc = [r[0] for r in rows_po]
-                
                 conn_tmp.close()
 
             with info_col:
@@ -780,15 +691,9 @@ with tab2:
                 f_art_sel = st.selectbox("Article No. *", art_opts, key="dc_art", disabled=(not bool(art_list)))
                 f_art  = "" if f_art_sel == "-- Select Article --" else f_art_sel
 
-                # NEW: Live Bilty (Lahore factory dispatch) indicator — shows as
-                # soon as Call-Off + Article are both selected. This is informational
-                # only and reads from the separate `bilty` ledger; it does not
-                # touch the existing Ordered/Received calculations below.
                 if f_coff and f_art:
                     bilty_done_art = get_bilty_qty(f_coff, f_art)
-                    ordered_for_art = scalar(
-                        "SELECT SUM(order_qty) FROM sheet_orders WHERE call_off_no=? AND article=?",
-                        [f_coff, f_art])
+                    ordered_for_art = scalar("SELECT SUM(order_qty) FROM sheet_orders WHERE call_off_no=? AND article=?", [f_coff, f_art])
                     rb = int(math.floor(bilty_done_art + 0.5))
                     ro = int(math.floor(ordered_for_art + 0.5))
                     pct_txt = f" ({(rb/ro*100):.0f}%)" if ro > 0 else ""
@@ -798,11 +703,9 @@ with tab2:
                     </div>""", unsafe_allow_html=True)
 
                 f_type = st.selectbox("Item Type *", ITEM_TYPES, key="dc_type")
-            
                 f_style = "—"
                 if f_type == "Inlay Card / Bandrolle":
                     f_style = st.selectbox("Style Type *", STYLES_INLAY, key="dc_style_inlay")
-                
                 f_token = st.text_input("Company Token", placeholder="e.g. TOK-771", key="dc_token")
             with c2:
                 f_dc   = st.text_input("DC No. *", key="dc_dcno")
@@ -814,7 +717,6 @@ with tab2:
         with dc_main_cols[1]:
             st.markdown("<h5>🎯 Live Contract Status Counter</h5>", unsafe_allow_html=True)
             max_allowed = 0
-        
             counter_cols = st.columns(2)
         
             if f_coff and f_contract:
@@ -830,7 +732,6 @@ with tab2:
                         max_allowed = scalar("SELECT SUM(order_qty) FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND category=? AND article=?", [f_coff, f_contract, item, f_art]) - scalar("SELECT SUM(qty) FROM inventory WHERE call_off_no=? AND contract_no=? AND category=? AND article=?", [f_coff, f_contract, item, f_art])
                 
                     b_cls = "kb" if r_q_rem > 0 else "kr"
-                
                     with counter_cols[idx % 2]:
                         st.markdown(f"""
                         <div class="kpi {b_cls}" style="margin-bottom: 8px; padding: 10px; border-radius: 6px; text-align: left; box-shadow: 0 2px 4px rgba(0,0,0,0.3);">
@@ -842,14 +743,6 @@ with tab2:
                         </div>
                         """, unsafe_allow_html=True)
 
-        # ═══════════════════════════════════════════════
-        # NEW ADDITION: Item-Wise Breakdown for the selected Article — shows
-        # Ordered/Received/Pending for EVERY category (Safety, Washing Paper,
-        # Tag Card, etc.) the instant an Article is picked, reusing the exact
-        # same "kpi kb"/"kpi kr" blue-box styling already used above. This is a
-        # pure addition and does not alter the existing counter_cols block or
-        # the bp1-bp4 single-item-type block below.
-        # ═══════════════════════════════════════════════
         if f_art:
             st.markdown(f"<h5>🧩 Item-Wise Breakdown — Article {f_art}</h5>", unsafe_allow_html=True)
             art_bd_cols = st.columns(4)
@@ -889,8 +782,7 @@ with tab2:
 
         st.markdown("---")
         if current_role not in DC_ENTRY_WRITE_ROLES:
-            st.info(f"🔒 Your role (**{current_role}**) has view-only access to DC Entry — you can see live stock/Bilty status above, "
-                    "but cannot add new entries. Contact an Admin or Data Entry user if a new DC needs to be recorded.")
+            st.info(f"🔒 Your role (**{current_role}**) has view-only access to DC Entry — you can see live stock/Bilty status above, but cannot add new entries.")
         elif st.button("💾 Save Entry", type="primary", key="dc_save"):
             s_dc   = str(f_dc).strip()
             s_po   = str(f_po).strip()
@@ -901,7 +793,7 @@ with tab2:
             rounded_max_allowed = int(math.floor(max_allowed + 0.5))
         
             if not s_dc or not s_po or not s_coff or f_qty <= 0 or not s_art:
-                st.error("⚠️ DC No., Call-Off, PO, Article and Quantity are required.")
+                st.error("⚠️ DC No., Call-Off., PO, Article and Quantity are required.")
             elif int(f_qty) > rounded_max_allowed and max_allowed >= 0:
                 st.error(f"🚨 ALERT! Over-delivery blocked. Max remaining allowed for {f_type} is exactly {rounded_max_allowed:,} Pcs. You cannot enter {int(f_qty):,} Pcs.")
             else:
@@ -910,26 +802,18 @@ with tab2:
                     INSERT INTO inventory
                     (call_off_no,contract_no,dc_no,po_no,article,category,qty,entry_date,remark,company_token,style_type)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                """, (s_coff, s_cont, s_dc, s_po, s_art, f_type, float(f_qty),
-                      str(f_date), str(f_remark).strip(), str(f_token).strip(), f_style))
+                """, (s_coff, s_cont, s_dc, s_po, s_art, f_type, float(f_qty), str(f_date), str(f_remark).strip(), str(f_token).strip(), f_style))
                 conn.commit()
                 conn.close()
                 st.success(f"✅ Entry saved — DC {s_dc} | {f_qty:,.0f} pcs of {f_type}")
                 st.rerun()
 
 # ═══════════════════════════════════════════════
-# TAB 3 — ALL ENTRIES (UNCHANGED)
+# TAB 3 — ALL ENTRIES
 # ═══════════════════════════════════════════════
 with tab3:
     if _access_ok("📋 All Entries"):
         st.markdown('<div class="sec">📋 Registered DC Entries Registry</div>', unsafe_allow_html=True)
-
-        # PERFORMANCE FIX: previously this loaded the ENTIRE inventory table into
-        # a DataFrame on every rerun and did the filtering in pandas — slow and
-        # growing slower with every new DC entry. Now a cheap COUNT checks if any
-        # data exists, filter dropdown options come from lightweight indexed
-        # DISTINCT queries, and the actual filtering happens in SQL (using the
-        # indexes created in get_conn) so only the matching rows are ever loaded.
         total_inv_count = scalar("SELECT COUNT(*) FROM inventory")
 
         if total_inv_count == 0:
@@ -938,16 +822,10 @@ with tab3:
             st.markdown("##### 🛠️ Advanced Multi-Filters")
             f_cols = st.columns(6)
 
-            # PERFORMANCE: on a remote DB, 6 separate round-trips (one per
-            # dropdown) are much slower than 1. This combines them into a
-            # single UNION ALL query, cached briefly so repeated reruns
-            # (e.g. while typing elsewhere on the page) don't re-hit the DB.
             @st.cache_data(ttl=15, show_spinner=False)
             def _tab3_filter_options():
                 cols = ["call_off_no", "po_no", "article", "dc_no", "company_token", "category"]
-                union_sql = " UNION ALL ".join(
-                    f"SELECT '{c}' AS col_name, {c} AS val FROM inventory WHERE TRIM({c})!=''" for c in cols
-                )
+                union_sql = " UNION ALL ".join(f"SELECT '{c}' AS col_name, {c} AS val FROM inventory WHERE TRIM({c})!=''" for c in cols)
                 df = q(union_sql)
                 return {c: sorted(df.loc[df["col_name"] == c, "val"].dropna().unique().tolist()) for c in cols}
 
@@ -965,7 +843,6 @@ with tab3:
                 sel_tok = st.selectbox("Filter Token", ["All"] + _opts["company_token"], key="f3_tok")
             with f_cols[5]:
                 sel_cat = st.selectbox("Filter Item Type", ["All"] + _opts["category"], key="f3_cat")
-
 
             where_sql, params = "WHERE 1=1", []
             if sel_coff != "All": where_sql += " AND call_off_no=?";    params.append(sel_coff)
@@ -994,8 +871,7 @@ with tab3:
             </div>""", unsafe_allow_html=True)
 
             df_show = df_inv.copy()
-            df_show.columns = ["ID","Call-Off","Contract #","DC No.","Token","PO No.",
-                               "Article","Item Type","Style","Qty","Date","Remark"]
+            df_show.columns = ["ID","Call-Off","Contract #","DC No.","Token","PO No.","Article","Item Type","Style","Qty","Date","Remark"]
             st.dataframe(df_show, use_container_width=True, hide_index=True)
 
             st.markdown("---")
@@ -1017,7 +893,7 @@ with tab3:
                             e_dc    = st.text_input("DC No.",       value=str(row["dc_no"]         or ""), key=f"e_dc_{row['id']}")
                         with ec3:
                             e_tok   = st.text_input("Company Token",value=str(row["company_token"] or ""), key=f"e_tok_{row['id']}")
-                            try:    dv = datetime.strptime(str(row["entry_date"]),"%Y-%m-%d").date()
+                            try:    dv = datetime.datetime.strptime(str(row["entry_date"]),"%Y-%m-%d").date()
                             except: dv = date.today()
                             e_date  = st.date_input("Date", value=dv, key=f"e_date_{row['id']}")
                             e_qty   = st.number_input("Quantity", min_value=0.0, step=1.0, value=float(row["qty"] or 0), format="%g", key=f"e_qty_{row['id']}")
@@ -1034,17 +910,12 @@ with tab3:
                                 """, (e_coff.strip(), e_cont.strip(), e_po.strip(), e_art.strip(), e_type, e_dc.strip(), str(e_date), float(e_qty), e_rem.strip(), e_tok.strip(), row["id"]))
                                 conn.commit(); conn.close()
 
-                                # Clear inline-edit UI state so the widgets reload fresh
-                                # values from the database on rerun (fixes stale/ghost
-                                # quantity showing after Update & Save).
                                 st.session_state["inline_edit_id"] = None
                                 for _k in (f"e_coff_{row['id']}", f"e_cont_{row['id']}", f"e_po_{row['id']}",
                                            f"e_art_{row['id']}", f"e_type_{row['id']}", f"e_dc_{row['id']}",
-                                           f"e_tok_{row['id']}", f"e_date_{row['id']}", f"e_qty_{row['id']}",
-                                           f"e_rem_{row['id']}"):
+                                           f"e_tok_{row['id']}", f"e_date_{row['id']}", f"e_qty_{row['id']}", f"e_rem_{row['id']}"):
                                     if _k in st.session_state:
                                         del st.session_state[_k]
-
                                 st.success("✅ Updated successfully!")
                                 st.rerun()
                         with eb2:
@@ -1086,7 +957,7 @@ with tab3:
                     st.rerun()
 
 # ═══════════════════════════════════════════════
-# TAB 4 — MASTER LEDGER (UPDATED LOGIC ADDEED!)
+# TAB 4 — MASTER LEDGER
 # ═══════════════════════════════════════════════
 with tab4:
     if _access_ok("📊 Master Ledger"):
@@ -1173,22 +1044,15 @@ with tab4:
                 with item_cols[idx % 3]:
                     st.markdown(f'<div class="kpi {cls}" style="margin-bottom: 6px;">⏳ Rem. {it_name}<br><b>{round_and_format(rem_val)}</b> Pcs</div>', unsafe_allow_html=True)
 
-            # ═══════════════════════════════════════════════
-            # 🆕 NEW ADDITION: CONTRACT-WISE SHORTFALL SUMMARY
-            # ═══════════════════════════════════════════════
             st.markdown("---")
             st.markdown("### 📌 CONTRACT-WISE SHORTFALL SUMMARY")
             st.info("💡 نیچے ہر سیلز کنٹریکٹ کے حساب سے الگ الگ بقایا (Shortfall) بریک ڈاؤن دکھایا گیا ہے:")
         
-            # گوبل لیجر سے اس کال آف کے تمام یونیک کنٹریکٹس نکالیں
             unique_contracts_in_ledger = sorted(df_ledger["Contract #"].unique().tolist())
         
             for contract_no in unique_contracts_in_ledger:
-                # اس مخصوص کنٹریکٹ کا ڈیٹا فلٹر کریں
                 df_contract_sub = df_ledger[df_ledger["Contract #"] == contract_no]
                 contract_item_summary = df_contract_sub.groupby("Item Type")["Remaining Balance"].sum().to_dict()
-            
-                # صرف وہ آئٹمز چیک کریں جن کا شارٹ فال 0 سے زیادہ ہے
                 has_shortage = any(v > 0 for v in contract_item_summary.values())
             
                 with st.expander(f"📄 Contract: {contract_no} | {'🚨 Shortage Pending' if has_shortage else '✅ Fully Cleared'}", expanded=True):
@@ -1196,8 +1060,6 @@ with tab4:
                     col_counter = 0
                     for it_name in ITEM_TYPES:
                         rem_val_sub = contract_item_summary.get(it_name, 0)
-                    
-                        # اگر بقایا 0 سے زیادہ ہے تو ڈبے کا رنگ لال (kr) ہوگا ورنہ ہرا (kg)
                         sub_cls = "kr" if rem_val_sub > 0 else "kg"
                     
                         with sub_cols[col_counter % 3]:
@@ -1208,7 +1070,6 @@ with tab4:
                             </div>
                             ''', unsafe_allow_html=True)
                         col_counter += 1
-            # ═══════════════════════════════════════════════
 
             st.markdown("---")
             hide_zero = st.checkbox("Hide rows with zero Remaining Balance", key="hide_zero_bal")
@@ -1249,9 +1110,6 @@ with tab4:
                 )
 
             with btn_c3:
-                # Contract-wise Shortlist: only ACTIVE/PENDING items for the currently
-                # selected Brand + Contract filters. Strict rounding removes any
-                # plus/minus float micro-garbage so true-zero articles never appear.
                 df_contract_shortlist = df_ledger[df_ledger["Remaining Balance"].apply(round_bal) > 0]
                 pdf_buf_contract = generate_ledger_pdf(item_summary, df_contract_shortlist, l_sel_coff, l_sel_cont, l_sel_art, report_type="CONTRACT_SHORTLIST")
                 safe_brand = (l_sel_br if l_sel_br != "All" else "AllBrands")
@@ -1266,7 +1124,7 @@ with tab4:
                 )
 
 # ═══════════════════════════════════════════════
-# TAB 5 — SHEET UPLOAD (UNCHANGED)
+# TAB 5 — SHEET UPLOAD
 # ═══════════════════════════════════════════════
 with tab5:
     if _access_ok("📤 Sheet Upload"):
@@ -1380,7 +1238,7 @@ with tab5:
                         st.success(f"✅ Sheet '{to_drop}' deleted!"); st.rerun()
 
 # ═══════════════════════════════════════════════
-# TAB 6 — 🆕 BILTY MANAGEMENT (Lahore ➜ Karachi Dispatch)
+# TAB 6 — BILTY MANAGEMENT
 # ═══════════════════════════════════════════════
 with tab6:
     if _access_ok("🚚 Bilty Management"):
@@ -1388,27 +1246,19 @@ with tab6:
         st.caption("یہ ایک نیا علیحدہ بلٹی لیجر ہے۔ اس کا پرانے Master Ledger (Ordered vs Received) کے حساب کتاب پر کوئی اثر نہیں پڑتا — صرف بلٹی/ڈسپیچ کا ریکارڈ رکھتا ہے۔")
 
         b_c1, b_c2 = st.columns([2, 2])
-
         with b_c1:
             b_coff_opts = get_calloff_list()
             b_sel_coff = st.selectbox("Select Call-Off Sheet *", ["-- Select --"] + b_coff_opts, key="bilty_coff")
 
         b_sel_cont = "-- Select --"
         if b_sel_coff != "-- Select --":
-            cont_opts = q(
-                "SELECT DISTINCT sale_contract FROM sheet_orders WHERE call_off_no=? AND TRIM(sale_contract)!='' ORDER BY sale_contract",
-                [b_sel_coff]
-            )["sale_contract"].tolist()
+            cont_opts = q("SELECT DISTINCT sale_contract FROM sheet_orders WHERE call_off_no=? AND TRIM(sale_contract)!='' ORDER BY sale_contract", [b_sel_coff])["sale_contract"].tolist()
             with b_c2:
                 b_sel_cont = st.selectbox("Select Sales Contract *", ["-- Select --"] + cont_opts, key="bilty_cont")
 
         if b_sel_coff == "-- Select --" or b_sel_cont == "-- Select --":
             st.info("👆 Please select a Call-Off Sheet and Sales Contract to load its articles.")
         else:
-            # FIX: quantity now comes straight from the Call-Off Sheet (sum of
-            # order_qty per Article + Category) instead of a manual fixed number.
-            # No typing needed — the checkbox label shows the exact sheet quantity,
-            # and ticking it adds that exact quantity to the grand total.
             df_arts = q("""
                 SELECT article, category, SUM(order_qty) AS sheet_qty
                 FROM sheet_orders
@@ -1432,10 +1282,6 @@ with tab6:
                             cat = r_row["category"]
                             cat_qty = float(r_row["sheet_qty"] or 0)
                             cb_key = f"bilty_cb_{b_sel_coff}_{b_sel_cont}_{art}_{cat}"
-                            # NEW ADDITION: manual quantity override, sits right
-                            # next to the existing checkbox. Defaults to the full
-                            # sheet quantity (same as before if left untouched) —
-                            # editable down for a partial/custom dispatch amount.
                             mq_key = f"bilty_manualqty_{b_sel_coff}_{b_sel_cont}_{art}_{cat}"
                             with tcols[i % 3]:
                                 is_checked = st.checkbox(f"{cat} ({cat_qty:,.0f} Pcs)", key=cb_key)
@@ -1473,8 +1319,7 @@ with tab6:
                             conn.execute("""
                                 INSERT INTO bilty (call_off_no, contract_no, article, category, qty, cartons, transport_mode, bilty_date, created_at)
                                 VALUES (?,?,?,?,?,?,?,?,?)
-                            """, (b_sel_coff, b_sel_cont, art, cat, float(cat_qty), int(cartons_n),
-                                  transport_mode, str(bilty_date_val), str(datetime.datetime.now())))
+                            """, (b_sel_coff, b_sel_cont, art, cat, float(cat_qty), int(cartons_n), transport_mode, str(bilty_date_val), str(datetime.datetime.now())))
                         conn.commit()
                         conn.close()
                         st.success(f"✅ Bilty saved — {len(ticked_items)} item(s), {grand_total:,.0f} Pcs total, {cartons_n} Carton(s) via {transport_mode}.")
@@ -1494,13 +1339,13 @@ with tab6:
                     st.dataframe(df_bilty_hist, use_container_width=True, hide_index=True)
 
 # ═══════════════════════════════════════════════
-# TAB 7 — 🆕 USER MANAGEMENT (Admin only)
+# TAB 7 — USER MANAGEMENT
 # ═══════════════════════════════════════════════
 with tab7:
     if _access_ok("👤 User Management"):
         st.markdown('<div class="sec">👤 User Management — Admin Only</div>', unsafe_allow_html=True)
-
         st.markdown("##### ➕ Create New User")
+        
         with st.form("create_user_form", clear_on_submit=True):
             nu_c1, nu_c2 = st.columns(2)
             with nu_c1:
@@ -1523,8 +1368,7 @@ with tab7:
                     conn.execute("""
                         INSERT INTO app_users (username,password_hash,role,full_name,created_at)
                         VALUES (?,?,?,?,?)
-                    """, (nu_username.strip(), _hash_password(nu_password), nu_role,
-                          nu_fullname.strip(), str(datetime.datetime.now())))
+                    """, (nu_username.strip(), _hash_password(nu_password), nu_role, nu_fullname.strip(), str(datetime.datetime.now())))
                     conn.commit()
                     conn.close()
                     st.success(f"✅ User '{nu_username.strip()}' created with role '{nu_role}'.")
@@ -1545,8 +1389,7 @@ with tab7:
                     st.error("⚠️ Enter a new password first.")
                 else:
                     conn = get_conn()
-                    conn.execute("UPDATE app_users SET password_hash=? WHERE username=?",
-                                 (_hash_password(rp_newpass), rp_user))
+                    conn.execute("UPDATE app_users SET password_hash=? WHERE username=?", (_hash_password(rp_newpass), rp_user))
                     conn.commit()
                     conn.close()
                     st.success(f"✅ Password reset for '{rp_user}'.")
