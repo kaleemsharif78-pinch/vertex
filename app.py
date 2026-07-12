@@ -1204,11 +1204,16 @@ with tab3:
                     st.rerun()
 
             # ═══════════════════════════════════════════════
-            # NEW ADDITION: Ditto DC (Excel) Generator — reproduces the exact
-            # layout of your real DC sheets (sampled from DC-4670/4689/4612,
-            # Cont#232603624): same header fields, same "Serial No / Customer
-            # PO / Item Code, Description, Brand / UOM / Quantity / Remarks"
-            # table, same "Total" row and "PACK OF 00 TO 00 CARTONS" footer.
+            # NEW ADDITION: Ditto DC (Excel) Generator — reproduces your real
+            # DC sheet layout (sampled from DC-4670/4689/4612, Cont#232603624),
+            # with the following client-requested adjustments:
+            #  - "VERTEX" branding centered above the Address line
+            #  - Contact number centered under the "DELIVERY CHALLAN" title
+            #  - "Token #" (Company Token) shown directly under "DC #",
+            #    replacing the PO Number in that header slot
+            #  - Per-category Total Sum lines (this DC's quantities only —
+            #    not remaining/pending balance) instead of one grand total
+            #  - A bordered "Article-Wise Summary" box (Article # → Pcs)
             # ═══════════════════════════════════════════════
             st.markdown("---")
             st.markdown('<div class="sec">🖨️ NEW: Generate Ditto DC (Excel)</div>', unsafe_allow_html=True)
@@ -1219,7 +1224,7 @@ with tab3:
 
             if ditto_dc_sel != "-- Select --":
                 df_dc_lines = q("""
-                    SELECT call_off_no, contract_no, po_no, article, category, qty, entry_date, remark, item_description
+                    SELECT call_off_no, contract_no, po_no, article, category, qty, entry_date, remark, item_description, company_token
                     FROM inventory WHERE dc_no=? ORDER BY id
                 """, [ditto_dc_sel])
 
@@ -1233,34 +1238,46 @@ with tab3:
                     if not brand_row.empty:
                         dc_brand = brand_row.iloc[0]["brand"]
 
-                    def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, po_no, brand, entry_date, line_items):
+                    def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, token_no, brand, entry_date, line_items):
                         import openpyxl
-                        from openpyxl.styles import Font
+                        from openpyxl.styles import Font, Alignment, Border, Side
                         wb = openpyxl.Workbook()
                         ws = wb.active
                         ws.title = (f"DC-{dc_no} {entry_date} Cont#{contract_no}")[:31]
                         bold = Font(bold=True)
+                        center = Alignment(horizontal="center", vertical="center")
+                        thin = Side(style="thin")
+                        box_border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-                        ws["B2"] = "Address: 24-Abbot Road, Opposite Metropole Cinema Lahore"
-                        ws["D3"] = "PH: +92 42 36283733    Mob: +92 300 4747660 "
-                        ws["G3"] = brand
-                        ws["D4"] = "Email: vertex.printerlhr@gmail.com"
-                        ws["G4"] = f"CALL OFF {call_off_no}"
-                        ws["B5"] = f"Date: {entry_date}"
-                        ws["D5"] = "DELIVERY CHALLAN"
-                        ws["E5"] = f"DC # {dc_no}"
-                        ws["B6"] = f"Cont #{contract_no}"
-                        ws["E6"] = f"PO # {po_no}"
-                        ws["B7"] = "Customer Name:  Gul Ahmed Textile Mills Limited (Karachi)"
+                        def _centered(row, text, size=10, b=False):
+                            ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=7)
+                            c = ws.cell(row=row, column=2, value=text)
+                            c.font = Font(bold=b, size=size)
+                            c.alignment = center
+
+                        # --- Header: Vertex branding centered above Address ---
+                        _centered(2, "VERTEX", size=20, b=True)
+                        _centered(3, "24-Abbot Road, Opposite Metropole Cinema, Lahore, Pakistan", size=10)
+                        _centered(4, "DELIVERY CHALLAN", size=14, b=True)
+                        # Contact number centered directly under the Delivery Challan title
+                        _centered(5, "PH: +92 42 36283733    Mob: +92 300 4747660", size=10)
+
+                        ws["B7"] = f"Date: {entry_date}"
+                        ws["E7"] = f"DC # {dc_no}"
+                        ws["G7"] = brand
+                        ws["B8"] = f"Cont #{contract_no}"
+                        # Token Number now shown directly under DC #, replacing PO Number here
+                        ws["E8"] = f"Token # {token_no}" if token_no else "Token # —"
+                        ws["G8"] = f"CALL OFF {call_off_no}"
+                        ws["B9"] = "Customer Name:  Gul Ahmed Textile Mills Limited (Karachi)"
 
                         headers = ["Serial No", "Customer PO", "Item Code, Description, Brand", "UOM", "Quantity", "Remarks"]
                         for i, h in enumerate(headers):
-                            ws.cell(row=9, column=2 + i, value=h).font = bold
+                            ws.cell(row=11, column=2 + i, value=h).font = bold
 
-                        total_qty = 0.0
                         n_slots = max(7, len(line_items))
                         for i in range(n_slots):
-                            r = 10 + i
+                            r = 12 + i
                             ws.cell(row=r, column=2, value=i + 1)
                             ws.cell(row=r, column=5, value="Nos")
                             if i < len(line_items):
@@ -1269,14 +1286,44 @@ with tab3:
                                 ws.cell(row=r, column=4, value=item.get("description", ""))
                                 ws.cell(row=r, column=6, value=item.get("qty", ""))
                                 ws.cell(row=r, column=7, value=item.get("remark", ""))
-                                total_qty += float(item.get("qty") or 0)
 
-                        trow = 10 + n_slots
-                        ws.cell(row=trow, column=4, value="Total").font = bold
-                        ws.cell(row=trow, column=6, value=total_qty)
-                        ws.cell(row=trow + 1, column=5, value="PACK OF 00 TO 00 CARTONS")
+                        # --- Per-category Total Sum lines (THIS DC's qty only,
+                        # not remaining/pending balance) — one line per category ---
+                        cat_totals = {}
+                        for item in line_items:
+                            cat = item.get("category", "")
+                            cat_totals[cat] = cat_totals.get(cat, 0) + float(item.get("qty") or 0)
 
-                        for col, w in {"B": 10, "C": 14, "D": 42, "E": 10, "F": 10, "G": 18}.items():
+                        r = 12 + n_slots + 1
+                        for cat, tot in cat_totals.items():
+                            ws.cell(row=r, column=4, value=f"{cat} Total").font = bold
+                            ws.cell(row=r, column=6, value=tot)
+                            r += 1
+
+                        r += 1
+                        ws.cell(row=r, column=5, value="PACK OF 00 TO 00 CARTONS")
+
+                        # --- Article-Wise Summary box (Article # -> Pcs) ---
+                        art_totals = {}
+                        for item in line_items:
+                            art = item.get("article", "")
+                            art_totals[art] = art_totals.get(art, 0) + float(item.get("qty") or 0)
+
+                        box_start_row = 12
+                        box_col = 9  # column I, to the right of the main table
+                        ws.cell(row=box_start_row, column=box_col, value="Article-Wise Summary").font = bold
+                        ws.cell(row=box_start_row, column=box_col).border = box_border
+                        ws.cell(row=box_start_row + 1, column=box_col, value="Article #").font = bold
+                        ws.cell(row=box_start_row + 1, column=box_col + 1, value="Pcs").font = bold
+                        ws.cell(row=box_start_row + 1, column=box_col).border = box_border
+                        ws.cell(row=box_start_row + 1, column=box_col + 1).border = box_border
+                        br = box_start_row + 2
+                        for art, tot in art_totals.items():
+                            ws.cell(row=br, column=box_col, value=art).border = box_border
+                            ws.cell(row=br, column=box_col + 1, value=tot).border = box_border
+                            br += 1
+
+                        for col, w in {"B": 10, "C": 14, "D": 42, "E": 10, "F": 10, "G": 18, "I": 16, "J": 10}.items():
                             ws.column_dimensions[col].width = w
 
                         buf = io.BytesIO()
@@ -1288,10 +1335,12 @@ with tab3:
                         "customer_po": r["po_no"],
                         "description": (str(r["item_description"]).strip() or f"{r['category']} — Article {r['article']}"),
                         "qty": r["qty"], "remark": r["remark"],
+                        "category": r["category"], "article": r["article"],
                     } for _, r in df_dc_lines.iterrows()]
 
+                    dc_token = hdr["company_token"] if str(hdr["company_token"]).strip() else ""
                     ditto_buf = _generate_ditto_dc_excel(
-                        ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], hdr["po_no"],
+                        ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], dc_token,
                         dc_brand, hdr["entry_date"], line_items)
 
                     st.download_button(
