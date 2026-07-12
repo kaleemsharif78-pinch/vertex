@@ -6,6 +6,7 @@ import io
 import math
 import hashlib
 import secrets as pysecrets
+import base64
 from datetime import date
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -128,6 +129,15 @@ def _init_schema():
     if missing_desc_cols:
         with engine.begin() as conn:
             for col in missing_desc_cols:
+                conn.execute(text(f"ALTER TABLE inventory ADD COLUMN {col} TEXT DEFAULT ''"))
+
+    # NEW ADDITION: destination column on inventory — the "SOHRAB/HSU"-style
+    # destination field shown on the DC layout (top-right, replacing the old
+    # plain Brand slot).
+    missing_dest_cols = [c for c in ["destination"] if c not in inv_cols]
+    if missing_dest_cols:
+        with engine.begin() as conn:
+            for col in missing_dest_cols:
                 conn.execute(text(f"ALTER TABLE inventory ADD COLUMN {col} TEXT DEFAULT ''"))
 
     # NEW ADDITION: last_seen column on app_users, powers the Active Users
@@ -696,7 +706,7 @@ with tab1:
                 df_it["Balance"] = df_it["ordered"] - df_it["qty"]
                 df_it.columns    = ["Item Type","Ordered","Received","Balance"]
                 st.subheader("📊 Balance by Item Type")
-                st.dataframe(df_it, use_container_width=True, hide_index=True)
+                st.dataframe(df_it, width='stretch', hide_index=True)
 
             if not df_inv.empty:
                 st.subheader(f"📋 DC Entry History ({len(df_inv)} records)")
@@ -707,7 +717,7 @@ with tab1:
                     "category":"Item Type","qty":"Qty",
                     "entry_date":"Date","remark":"Remark"
                 }).drop(columns=["id"])
-                st.dataframe(disp, use_container_width=True, hide_index=True)
+                st.dataframe(disp, width='stretch', hide_index=True)
             else:
                 st.info("No DC entries found.")
 
@@ -728,7 +738,7 @@ with tab1:
 
             if not df_bilty_search.empty:
                 st.subheader(f"🚚 Bilty Dispatch History ({len(df_bilty_search)} records)")
-                st.dataframe(df_bilty_search, use_container_width=True, hide_index=True)
+                st.dataframe(df_bilty_search, width='stretch', hide_index=True)
 
             if st.button("🔄 Clear Search", key="clear_gs"):
                 st.session_state.pop("gs_sel", None)
@@ -899,6 +909,7 @@ with tab2:
                     dp_j_art = dp_m_art = ""
 
                 f_remark = st.text_area("Remark / Notes", height=90, key="dc_remark")
+                f_destination = st.text_input("Destination", key="dc_destination", placeholder="e.g. SOHRAB/HSU")
 
         with dc_main_cols[1]:
             st.markdown("<h5>🎯 Live Contract Status Counter</h5>", unsafe_allow_html=True)
@@ -989,18 +1000,18 @@ with tab2:
                     if f_qty_jersey > 0:
                         conn.execute("""
                             INSERT INTO inventory
-                            (call_off_no,contract_no,dc_no,po_no,article,category,qty,entry_date,remark,company_token,style_type,item_description)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                            (call_off_no,contract_no,dc_no,po_no,article,category,qty,entry_date,remark,company_token,style_type,item_description,destination)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """, (s_coff, s_cont, s_dc, s_po, str(dp_j_art), f_type, float(f_qty_jersey),
-                              str(f_date), f"[Jersey] {str(f_remark).strip()}".strip(), str(f_token).strip(), f_style, str(f_desc_jersey).strip()))
+                              str(f_date), f"[Jersey] {str(f_remark).strip()}".strip(), str(f_token).strip(), f_style, str(f_desc_jersey).strip(), str(f_destination).strip()))
                         saved_parts.append(f"Jersey {f_qty_jersey:,.0f} Pcs (Art. {dp_j_art})")
                     if f_qty_molton > 0:
                         conn.execute("""
                             INSERT INTO inventory
-                            (call_off_no,contract_no,dc_no,po_no,article,category,qty,entry_date,remark,company_token,style_type,item_description)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                            (call_off_no,contract_no,dc_no,po_no,article,category,qty,entry_date,remark,company_token,style_type,item_description,destination)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """, (s_coff, s_cont, s_dc, s_po, str(dp_m_art), f_type, float(f_qty_molton),
-                              str(f_date), f"[Molton] {str(f_remark).strip()}".strip(), str(f_token).strip(), f_style, str(f_desc_molton).strip()))
+                              str(f_date), f"[Molton] {str(f_remark).strip()}".strip(), str(f_token).strip(), f_style, str(f_desc_molton).strip(), str(f_destination).strip()))
                         saved_parts.append(f"Molton {f_qty_molton:,.0f} Pcs (Art. {dp_m_art})")
                     conn.commit()
                     conn.close()
@@ -1025,10 +1036,10 @@ with tab2:
                 conn = get_conn()
                 conn.execute("""
                     INSERT INTO inventory
-                    (call_off_no,contract_no,dc_no,po_no,article,category,qty,entry_date,remark,company_token,style_type,item_description)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    (call_off_no,contract_no,dc_no,po_no,article,category,qty,entry_date,remark,company_token,style_type,item_description,destination)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (s_coff, s_cont, s_dc, s_po, s_art, f_type, float(f_qty),
-                      str(f_date), str(f_remark).strip(), str(f_token).strip(), f_style, str(f_desc).strip()))
+                      str(f_date), str(f_remark).strip(), str(f_token).strip(), f_style, str(f_desc).strip(), str(f_destination).strip()))
                 conn.commit()
                 conn.close()
                 save_cached_item_description(s_art, f_type, f_desc)
@@ -1114,7 +1125,7 @@ with tab3:
             df_show = df_inv.copy()
             df_show.columns = ["ID","Call-Off","Contract #","DC No.","Token","PO No.",
                                "Article","Item Type","Style","Qty","Date","Remark"]
-            st.dataframe(df_show, use_container_width=True, hide_index=True)
+            st.dataframe(df_show, width='stretch', hide_index=True)
 
             st.markdown("---")
             st.markdown("### 🛠️ Edit / Delete Entries")
@@ -1204,27 +1215,44 @@ with tab3:
                     st.rerun()
 
             # ═══════════════════════════════════════════════
-            # NEW ADDITION: Ditto DC (Excel) Generator — reproduces your real
-            # DC sheet layout (sampled from DC-4670/4689/4612, Cont#232603624),
-            # with the following client-requested adjustments:
-            #  - "VERTEX" branding centered above the Address line
-            #  - Contact number centered under the "DELIVERY CHALLAN" title
-            #  - "Token #" (Company Token) shown directly under "DC #",
-            #    replacing the PO Number in that header slot
-            #  - Per-category Total Sum lines (this DC's quantities only —
-            #    not remaining/pending balance) instead of one grand total
-            #  - A bordered "Article-Wise Summary" box (Article # → Pcs)
+            # NEW ADDITION: Ditto DC Generator — matches the client-provided
+            # exact reference layout (DC-8865_ditto) precisely:
+            #  - "VERTEX" centered above Address
+            #  - Destination field (top-right, replacing the old Brand slot)
+            #  - "DELIVERY CHALLAN" + centered contact number
+            #  - "Token #" directly under "DC #"
+            #  - "S.No" header, Total row, "PACK OF 00 TO 00 CARTONS" footer
+            #  - Article-Wise Summary matrix: Article # rows × per-category
+            #    columns (Safety / Washing Paper excluded — they're global
+            #    commodity items common to every article, not distinguishing)
+            #  - Live print preview + Print button, right here in the DC tab
+            #  - PDF filename matches the on-screen/tab name exactly:
+            #    DC-{no}_GulAhmed_{date}_Cont-{contract}
             # ═══════════════════════════════════════════════
             st.markdown("---")
-            st.markdown('<div class="sec">🖨️ NEW: Generate Ditto DC (Excel)</div>', unsafe_allow_html=True)
-            st.caption("موجودہ DC انٹریز سے، بالکل اصل ڈی سی شیٹ کے فارمیٹ جیسی ایکسل فائل بنائیں۔")
+            st.markdown('<div class="sec">🖨️ NEW: Generate Ditto DC</div>', unsafe_allow_html=True)
+            st.caption("موجودہ DC انٹریز سے، بالکل اصل ڈی سی لے آؤٹ جیسی فائل بنائیں — لائیو پریویو اور پرنٹ بٹن کے ساتھ۔")
 
             ditto_dc_opts = q("SELECT DISTINCT dc_no FROM inventory WHERE TRIM(dc_no)!='' ORDER BY dc_no")["dc_no"].tolist()
             ditto_dc_sel = st.selectbox("Select DC No.", ["-- Select --"] + ditto_dc_opts, key="ditto_dc_sel")
 
+            # Categories treated as global/common (not article-distinguishing)
+            # — excluded from the Article-Wise Summary matrix columns.
+            DITTO_GLOBAL_CATEGORIES = {"Safety", "Washing Paper"}
+            DITTO_CATEGORY_SHORT_LABELS = {
+                "Inlay Card / Bandrolle": "Inlay Cards",
+                "Tag Card / Barcode Sticker": "Tag Cards",
+                "Barcode Item": "Barcode Stickers",
+                "Safety": "Safety Stickers",
+                "Washing Paper": "Washing Papers",
+                "Transparent Sticker": "Transparent Stickers",
+                "Eco Friendly": "Eco Stickers",
+            }
+
             if ditto_dc_sel != "-- Select --":
                 df_dc_lines = q("""
-                    SELECT call_off_no, contract_no, po_no, article, category, qty, entry_date, remark, item_description, company_token
+                    SELECT call_off_no, contract_no, po_no, article, category, qty, entry_date, remark,
+                           item_description, company_token, destination
                     FROM inventory WHERE dc_no=? ORDER BY id
                 """, [ditto_dc_sel])
 
@@ -1232,104 +1260,8 @@ with tab3:
                     st.info("No line items found for this DC.")
                 else:
                     hdr = df_dc_lines.iloc[0]
-                    dc_brand = ""
-                    brand_row = q("SELECT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? LIMIT 1",
-                                  [hdr["call_off_no"], hdr["contract_no"]])
-                    if not brand_row.empty:
-                        dc_brand = brand_row.iloc[0]["brand"]
-
-                    def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, token_no, brand, entry_date, line_items):
-                        import openpyxl
-                        from openpyxl.styles import Font, Alignment, Border, Side
-                        wb = openpyxl.Workbook()
-                        ws = wb.active
-                        ws.title = (f"DC-{dc_no} {entry_date} Cont#{contract_no}")[:31]
-                        bold = Font(bold=True)
-                        center = Alignment(horizontal="center", vertical="center")
-                        thin = Side(style="thin")
-                        box_border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-                        def _centered(row, text, size=10, b=False):
-                            ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=7)
-                            c = ws.cell(row=row, column=2, value=text)
-                            c.font = Font(bold=b, size=size)
-                            c.alignment = center
-
-                        # --- Header: Vertex branding centered above Address ---
-                        _centered(2, "VERTEX", size=20, b=True)
-                        _centered(3, "24-Abbot Road, Opposite Metropole Cinema, Lahore, Pakistan", size=10)
-                        _centered(4, "DELIVERY CHALLAN", size=14, b=True)
-                        # Contact number centered directly under the Delivery Challan title
-                        _centered(5, "PH: +92 42 36283733    Mob: +92 300 4747660", size=10)
-
-                        ws["B7"] = f"Date: {entry_date}"
-                        ws["E7"] = f"DC # {dc_no}"
-                        ws["G7"] = brand
-                        ws["B8"] = f"Cont #{contract_no}"
-                        # Token Number now shown directly under DC #, replacing PO Number here
-                        ws["E8"] = f"Token # {token_no}" if token_no else "Token # —"
-                        ws["G8"] = f"CALL OFF {call_off_no}"
-                        ws["B9"] = "Customer Name:  Gul Ahmed Textile Mills Limited (Karachi)"
-
-                        headers = ["Serial No", "Customer PO", "Item Code, Description, Brand", "UOM", "Quantity", "Remarks"]
-                        for i, h in enumerate(headers):
-                            ws.cell(row=11, column=2 + i, value=h).font = bold
-
-                        n_slots = max(7, len(line_items))
-                        for i in range(n_slots):
-                            r = 12 + i
-                            ws.cell(row=r, column=2, value=i + 1)
-                            ws.cell(row=r, column=5, value="Nos")
-                            if i < len(line_items):
-                                item = line_items[i]
-                                ws.cell(row=r, column=3, value=item.get("customer_po", ""))
-                                ws.cell(row=r, column=4, value=item.get("description", ""))
-                                ws.cell(row=r, column=6, value=item.get("qty", ""))
-                                ws.cell(row=r, column=7, value=item.get("remark", ""))
-
-                        # --- Per-category Total Sum lines (THIS DC's qty only,
-                        # not remaining/pending balance) — one line per category ---
-                        cat_totals = {}
-                        for item in line_items:
-                            cat = item.get("category", "")
-                            cat_totals[cat] = cat_totals.get(cat, 0) + float(item.get("qty") or 0)
-
-                        r = 12 + n_slots + 1
-                        for cat, tot in cat_totals.items():
-                            ws.cell(row=r, column=4, value=f"{cat} Total").font = bold
-                            ws.cell(row=r, column=6, value=tot)
-                            r += 1
-
-                        r += 1
-                        ws.cell(row=r, column=5, value="PACK OF 00 TO 00 CARTONS")
-
-                        # --- Article-Wise Summary box (Article # -> Pcs) ---
-                        art_totals = {}
-                        for item in line_items:
-                            art = item.get("article", "")
-                            art_totals[art] = art_totals.get(art, 0) + float(item.get("qty") or 0)
-
-                        box_start_row = 12
-                        box_col = 9  # column I, to the right of the main table
-                        ws.cell(row=box_start_row, column=box_col, value="Article-Wise Summary").font = bold
-                        ws.cell(row=box_start_row, column=box_col).border = box_border
-                        ws.cell(row=box_start_row + 1, column=box_col, value="Article #").font = bold
-                        ws.cell(row=box_start_row + 1, column=box_col + 1, value="Pcs").font = bold
-                        ws.cell(row=box_start_row + 1, column=box_col).border = box_border
-                        ws.cell(row=box_start_row + 1, column=box_col + 1).border = box_border
-                        br = box_start_row + 2
-                        for art, tot in art_totals.items():
-                            ws.cell(row=br, column=box_col, value=art).border = box_border
-                            ws.cell(row=br, column=box_col + 1, value=tot).border = box_border
-                            br += 1
-
-                        for col, w in {"B": 10, "C": 14, "D": 42, "E": 10, "F": 10, "G": 18, "I": 16, "J": 10}.items():
-                            ws.column_dimensions[col].width = w
-
-                        buf = io.BytesIO()
-                        wb.save(buf)
-                        buf.seek(0)
-                        return buf
+                    dc_token = hdr["company_token"] if str(hdr["company_token"]).strip() else ""
+                    dc_dest = hdr["destination"] if str(hdr["destination"]).strip() else ""
 
                     line_items = [{
                         "customer_po": r["po_no"],
@@ -1338,22 +1270,214 @@ with tab3:
                         "category": r["category"], "article": r["article"],
                     } for _, r in df_dc_lines.iterrows()]
 
-                    dc_token = hdr["company_token"] if str(hdr["company_token"]).strip() else ""
-                    ditto_buf = _generate_ditto_dc_excel(
-                        ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], dc_token,
-                        dc_brand, hdr["entry_date"], line_items)
+                    # File / tab name — identical for the sheet title, the
+                    # PDF download, and what's shown on screen, as requested.
+                    ditto_filename_base = f"DC-{ditto_dc_sel}_GulAhmed_{hdr['entry_date']}_Cont-{hdr['contract_no']}"
+                    st.markdown(f"**📄 File Name:** `{ditto_filename_base}`")
 
-                    st.download_button(
-                        label="🖨️ Download Ditto DC (Excel)",
-                        data=ditto_buf,
-                        file_name=f"DC-{ditto_dc_sel}_ditto.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        type="primary",
-                        key="ditto_dc_download"
-                    )
+                    def _dc_article_matrix(items):
+                        cats_present = sorted({i["category"] for i in items if i["category"] not in DITTO_GLOBAL_CATEGORIES})
+                        arts_present = sorted({i["article"] for i in items})
+                        matrix = {a: {c: 0.0 for c in cats_present} for a in arts_present}
+                        for i in items:
+                            if i["category"] in DITTO_GLOBAL_CATEGORIES:
+                                continue
+                            matrix[i["article"]][i["category"]] += float(i.get("qty") or 0)
+                        return cats_present, arts_present, matrix
+
+                    def _dc_category_totals(items):
+                        totals = {}
+                        for i in items:
+                            totals[i["category"]] = totals.get(i["category"], 0) + float(i.get("qty") or 0)
+                        return totals
+
+                    # ── Excel (.xlsx) generator ──
+                    def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, token_no, destination, entry_date, items):
+                        import openpyxl
+                        from openpyxl.styles import Font, Alignment, Border, Side
+                        wb = openpyxl.Workbook()
+                        ws = wb.active
+                        ws.title = ditto_filename_base[:31]
+                        bold = Font(bold=True)
+                        center = Alignment(horizontal="center", vertical="center")
+                        thin = Side(style="thin")
+                        box_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+                        ws.merge_cells("B2:G2")
+                        c = ws["B2"]; c.value = "VERTEX"; c.font = Font(bold=True, size=20); c.alignment = center
+
+                        ws["D3"] = "24-Abbot Road, Opposite Metropole Cinema, Lahore, Pakistan"
+                        ws["D4"] = "PH: +92 42 36283733    Mob: +92 300 4747660"
+                        ws["G4"] = destination
+                        ws["D5"] = "Email: vertex.printerlhr@gmail.com"
+                        ws["G5"] = f"CALL OFF {call_off_no}"
+
+                        ws.merge_cells("B6:C6"); ws["B6"] = f"Date: {entry_date}"
+                        ws["D6"] = "DELIVERY CHALLAN"
+                        ws.merge_cells("E6:G6"); ws["E6"] = f"DC # {dc_no}"
+
+                        ws.merge_cells("B7:D7"); ws["B7"] = f"Cont #{contract_no}"
+                        ws.merge_cells("E7:G7"); ws["E7"] = f"Token # {token_no}" if token_no else "Token # —"
+
+                        ws.merge_cells("B8:G8")
+                        ws["B8"] = "Customer Name:  Gul Ahmed Textile Mills Limited (Karachi)"
+
+                        headers = ["S.No", "Customer PO", "Item Code, Description, Brand", "UOM", "Quantity", "Remarks"]
+                        for i, h in enumerate(headers):
+                            ws.cell(row=9, column=2 + i, value=h).font = bold
+
+                        n_slots = max(7, len(items))
+                        for i in range(n_slots):
+                            r = 10 + i
+                            ws.cell(row=r, column=2, value=i + 1)
+                            ws.cell(row=r, column=5, value="Nos")
+                            if i < len(items):
+                                item = items[i]
+                                ws.cell(row=r, column=3, value=item.get("customer_po", ""))
+                                ws.cell(row=r, column=4, value=item.get("description", ""))
+                                ws.cell(row=r, column=6, value=item.get("qty", ""))
+                                ws.cell(row=r, column=7, value=item.get("remark", ""))
+
+                        # 3 blank spacer rows, then Total (matches reference layout)
+                        total_row = 10 + n_slots + 3
+                        ws.merge_cells(start_row=total_row, start_column=4, end_row=total_row, end_column=5)
+                        ws.cell(row=total_row, column=4, value="Total").font = bold
+                        ws.cell(row=total_row, column=6, value=sum(float(i.get("qty") or 0) for i in items))
+
+                        ws.cell(row=total_row + 1, column=5, value="PACK OF 00 TO 00 CARTONS")
+
+                        cats_present, arts_present, matrix = _dc_article_matrix(items)
+                        aw_row = total_row + 2
+                        ws.cell(row=aw_row, column=4, value="Article-Wise Summary").font = bold
+                        ws.cell(row=aw_row + 1, column=4, value="Article #").font = bold
+                        for ci, cat in enumerate(cats_present):
+                            ws.cell(row=aw_row + 1, column=5 + ci, value=DITTO_CATEGORY_SHORT_LABELS.get(cat, cat)).font = bold
+                        for ai, art in enumerate(arts_present):
+                            rr = aw_row + 2 + ai
+                            ws.cell(row=rr, column=4, value=art)
+                            for ci, cat in enumerate(cats_present):
+                                ws.cell(row=rr, column=5 + ci, value=matrix[art][cat])
+
+                        for col, w in {"B": 10, "C": 14, "D": 42, "E": 12, "F": 12, "G": 18}.items():
+                            ws.column_dimensions[col].width = w
+
+                        buf = io.BytesIO()
+                        wb.save(buf)
+                        buf.seek(0)
+                        return buf
+
+                    # ── PDF generator (same layout, for live preview / print / download) ──
+                    def _generate_ditto_dc_pdf(dc_no, call_off_no, contract_no, token_no, destination, entry_date, items):
+                        buffer = io.BytesIO()
+                        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=25, bottomMargin=25)
+                        story = []
+                        styles = getSampleStyleSheet()
+                        center_title = ParagraphStyle('DCTitle', parent=styles['Normal'], fontSize=22, leading=26, alignment=1, fontName='Helvetica-Bold')
+                        center_sub = ParagraphStyle('DCSub', parent=styles['Normal'], fontSize=10, leading=13, alignment=1)
+                        center_dc = ParagraphStyle('DCHdr', parent=styles['Normal'], fontSize=14, leading=18, alignment=1, fontName='Helvetica-Bold')
+
+                        story.append(Paragraph("VERTEX", center_title))
+                        story.append(Paragraph("24-Abbot Road, Opposite Metropole Cinema, Lahore, Pakistan", center_sub))
+                        story.append(Paragraph("DELIVERY CHALLAN", center_dc))
+                        story.append(Paragraph("PH: +92 42 36283733&nbsp;&nbsp;&nbsp;&nbsp;Mob: +92 300 4747660", center_sub))
+                        story.append(Spacer(1, 10))
+
+                        info_data = [
+                            [f"Date: {entry_date}", f"DC # {dc_no}"],
+                            [f"Cont #{contract_no}", f"Token # {token_no}" if token_no else "Token # —"],
+                            [f"Destination: {destination}", f"CALL OFF {call_off_no}"],
+                        ]
+                        t_info = Table(info_data, colWidths=[270, 270])
+                        t_info.setStyle(TableStyle([('FONTSIZE', (0, 0), (-1, -1), 10), ('BOTTOMPADDING', (0, 0), (-1, -1), 4)]))
+                        story.append(t_info)
+                        story.append(Paragraph("Customer Name:  Gul Ahmed Textile Mills Limited (Karachi)",
+                                                ParagraphStyle('Cust', parent=styles['Normal'], fontSize=10, spaceBefore=4)))
+                        story.append(Spacer(1, 10))
+
+                        item_data = [["S.No", "Customer PO", "Item Code, Description, Brand", "UOM", "Quantity", "Remarks"]]
+                        for i, item in enumerate(items):
+                            item_data.append([i + 1, item.get("customer_po", ""), item.get("description", ""),
+                                               "Nos", round_and_format(item.get("qty") or 0), item.get("remark", "")])
+                        n_slots = max(7, len(items))
+                        for i in range(len(items), n_slots):
+                            item_data.append([i + 1, "", "", "Nos", "", ""])
+
+                        t_items = Table(item_data, colWidths=[35, 70, 210, 40, 60, 125])
+                        t_items.setStyle(TableStyle([
+                            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f1f5f9')),
+                            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                            ('FONTSIZE', (0, 0), (-1, -1), 8),
+                            ('ALIGN', (4, 1), (4, -1), 'RIGHT'),
+                        ]))
+                        story.append(t_items)
+                        story.append(Spacer(1, 10))
+
+                        cat_totals = _dc_category_totals(items)
+                        for cat, tot in cat_totals.items():
+                            story.append(Paragraph(f"<b>{cat} Total: {round_and_format(tot)}</b>",
+                                                    ParagraphStyle('CatTot', parent=styles['Normal'], fontSize=9, alignment=2)))
+                        story.append(Spacer(1, 6))
+                        story.append(Paragraph("PACK OF 00 TO 00 CARTONS",
+                                                ParagraphStyle('Pack', parent=styles['Normal'], fontSize=9, alignment=1)))
+                        story.append(Spacer(1, 14))
+
+                        cats_present, arts_present, matrix = _dc_article_matrix(items)
+                        if arts_present:
+                            aw_header = ["Article #"] + [DITTO_CATEGORY_SHORT_LABELS.get(c, c) for c in cats_present]
+                            aw_data = [aw_header]
+                            for art in arts_present:
+                                aw_data.append([art] + [round_and_format(matrix[art][c]) for c in cats_present])
+                            t_aw = Table(aw_data, colWidths=[80] + [90] * len(cats_present))
+                            t_aw.setStyle(TableStyle([
+                                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f1f5f9')),
+                                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                                ('FONTSIZE', (0, 0), (-1, -1), 8),
+                            ]))
+                            story.append(Paragraph("<b>Article-Wise Summary</b>", ParagraphStyle('AWTitle', parent=styles['Normal'], fontSize=10, spaceAfter=4)))
+                            story.append(t_aw)
+
+                        doc.build(story)
+                        buffer.seek(0)
+                        return buffer
+
+                    ditto_pdf_buf = _generate_ditto_dc_pdf(ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], dc_token, dc_dest, hdr["entry_date"], line_items)
+                    ditto_xlsx_buf = _generate_ditto_dc_excel(ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], dc_token, dc_dest, hdr["entry_date"], line_items)
+
+                    # ── Live print preview, right here in the DC tab ──
+                    st.markdown("##### 👁️ Live Print Preview")
+                    b64_pdf = base64.b64encode(ditto_pdf_buf.getvalue()).decode()
+                    st.markdown(
+                        f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="600" style="border:1px solid #334155;border-radius:8px;"></iframe>',
+                        unsafe_allow_html=True)
+
+                    dl1, dl2, dl3 = st.columns(3)
+                    with dl1:
+                        st.download_button(
+                            label="⬇️ Download PDF", data=ditto_pdf_buf,
+                            file_name=f"{ditto_filename_base}.pdf", mime="application/pdf",
+                            type="primary", key="ditto_dc_download_pdf")
+                    with dl2:
+                        st.download_button(
+                            label="⬇️ Download Excel", data=ditto_xlsx_buf,
+                            file_name=f"{ditto_filename_base}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="ditto_dc_download_xlsx")
+                    with dl3:
+                        # Print button — opens the PDF in a new tab and triggers
+                        # the browser's native print dialog there.
+                        components.html(f"""
+                            <button onclick="var w=window.open('data:application/pdf;base64,{b64_pdf}');
+                                              if(w){{ w.onload = function() {{ w.print(); }}; }}"
+                                    style="width:100%;padding:9px 0;background:#ef4444;color:white;border:none;
+                                           border-radius:6px;cursor:pointer;font-weight:600;font-size:14px;">
+                                🖨️ Print DC
+                            </button>
+                        """, height=45)
+
                     st.caption("✅ Item Description اب DC Entry فارم میں '(as per PO)' فیلڈ سے آتی ہے — جو ایک بار ٹائپ کریں وہ اگلی بار "
-                               "اسی آرٹیکل/کیٹیگری کے لیے خود بخود suggest ہو جائے گی۔ اگر پرانی انٹریز میں یہ فیلڈ خالی چھوڑی گئی تھی تو وہاں "
-                               "عارضی طور پر category + article نمبر دکھایا جائے گا۔")
+                               "اسی آرٹیکل/کیٹیگری کے لیے خود بخود suggest ہو جائے گی۔")
 
 # ═══════════════════════════════════════════════
 # TAB 4 — MASTER LEDGER (UPDATED LOGIC ADDEED!)
@@ -1490,7 +1614,7 @@ with tab4:
             df_fmt["Total Received"]    = df_fmt["Total Received"].apply(round_and_format)
             df_fmt["Remaining Balance"] = df_fmt["Remaining Balance"].apply(lambda x: "" if x == 0 else round_and_format(x))
 
-            st.dataframe(df_fmt, use_container_width=True, hide_index=True)
+            st.dataframe(df_fmt, width='stretch', hide_index=True)
 
             st.markdown("##### 🖨️ Export options:")
             btn_c1, btn_c2, btn_c3 = st.columns([2.5, 3, 3.2])
@@ -1635,7 +1759,7 @@ with tab5:
             st.info("No sheets loaded yet.")
         else:
             value_df["Total Qty"] = value_df["Total Qty"].apply(lambda x: round_and_format(float(str(x).replace(",",""))))
-            st.dataframe(value_df, use_container_width=True, hide_index=True)
+            st.dataframe(value_df, width='stretch', hide_index=True)
 
             st.markdown("### 🗑️ Delete a Sheet")
             sheet_opts = q("SELECT DISTINCT call_off_no FROM sheet_orders ORDER BY call_off_no")["call_off_no"].tolist()
@@ -1776,7 +1900,7 @@ with tab5:
                 if dual_pack_contracts:
                     st.info(f"🧵 Dual-pack (Jersey + Molton) detected for Contract(s): {', '.join(dual_pack_contracts)} — "
                              "DC Entry will show split quantity fields for these.")
-                st.dataframe(df_preview, use_container_width=True, hide_index=True)
+                st.dataframe(df_preview, width='stretch', hide_index=True)
 
                 if st.button("💾 Insert into System", type="primary", key="pd_insert_btn"):
                     conn = get_conn()
@@ -1908,7 +2032,7 @@ with tab6:
                 if df_bilty_hist.empty:
                     st.info("No Bilty records saved yet for this contract.")
                 else:
-                    st.dataframe(df_bilty_hist, use_container_width=True, hide_index=True)
+                    st.dataframe(df_bilty_hist, width='stretch', hide_index=True)
 
 # ═══════════════════════════════════════════════
 # TAB 7 — 🆕 USER MANAGEMENT (Admin only)
@@ -1971,7 +2095,7 @@ with tab7:
         st.markdown("---")
         st.markdown("##### 📋 All Users")
         df_users = q("SELECT username AS Username, full_name AS \"Full Name\", role AS Role, created_at AS \"Created At\" FROM app_users ORDER BY username")
-        st.dataframe(df_users, use_container_width=True, hide_index=True)
+        st.dataframe(df_users, width='stretch', hide_index=True)
 
         st.markdown("##### 🗑️ Delete a User")
         del_candidates = [u for u in all_usernames if u != current_user["username"]]
