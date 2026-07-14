@@ -495,6 +495,17 @@ DITTO_CATEGORY_SHORT_LABELS = {
     "Eco Friendly": "Eco Stickers",
 }
 
+def _apply_grid_borders(ws):
+    """NEW ADDITION: applies a thin border around every used cell so Excel
+    exports look like a proper bordered table (matching the PDF's grid
+    lines) instead of a blank, line-less sheet."""
+    from openpyxl.styles import Border, Side
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+        for cell in row:
+            cell.border = border
+
 def _fmt_date_ddmmyyyy(d):
     """Prints dates as DD-MM-YYYY on all printouts, regardless of how the
     date is stored internally (kept as ISO YYYY-MM-DD in the DB itself)."""
@@ -631,6 +642,8 @@ def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, token_no, destinat
     from openpyxl.utils import get_column_letter
     for col_idx in range(8, 25):
         ws.column_dimensions[get_column_letter(col_idx)].width = 14
+
+    _apply_grid_borders(ws)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1176,78 +1189,37 @@ with tab2:
                 art_list = q("SELECT DISTINCT article FROM sheet_orders WHERE call_off_no=? ORDER BY article", [f_coff])["article"].tolist()
 
                 if contracts_for_coff:
-                with c_sc2:
+                    with c_sc2:
+                        if len(contracts_for_coff) == 1:
+                            f_contract = contracts_for_coff[0]
+                            st.text_input("Contract # (Auto-loaded)", value=f_contract, disabled=True, key="dc_cont_ro")
+                        else:
+                            f_contract = st.selectbox("Select Contract # *", contracts_for_coff, key="dc_cont_sel")
+                
+                    brand_r = conn_tmp.execute(
+                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
+                        [f_coff, f_contract]).fetchone()
+                    brand = brand_r[0] if brand_r else ""
+
+                    rows_po = conn_tmp.execute(
+                        "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(po_no)!='' ORDER BY po_no",
+                        [f_coff, f_contract]).fetchall()
+                    po_for_sc = [r[0] for r in rows_po]
                 else:
-                            f_contract = st.selectbox("Select Contract", options=[]) # آپ کا سلیکٹ باکس کوڈ یہاں ہوگا
-
-                    # --- یہاں سے مستقل حل شروع ہوتا ہے ---
-                    # 1. پہلے ڈیٹا بیس کنکشن قائم کریں تاکہ conn_tmp ہر حال میں موجود ہو
-                    import sqlite3
-                    import os
-
-                    db_path = st.secrets.get("DB_URL", "textile_inventory.db")
-                    if db_path.startswith("sqlite:///"):
-                        db_path = db_path.replace("sqlite:///", "")
-
-                    conn_tmp = sqlite3.connect(db_path)
-
-                    # 2. فیلڈز کی موجودگی کی تصدیق کریں
-                    temp_coff = f_coff if 'f_coff' in locals() or 'f_coff' in globals() else ""
-                    temp_contract = f_contract if 'f_contract' in locals() or 'f_contract' in globals() else ""
-
-                    val_coff = str(temp_coff) if temp_coff is not None else ""
-                    val_contract = str(temp_contract) if temp_contract is not None else ""
-
-                    # 3. اب برانڈ لانے کے لیے کیوری چلائیں
                     brand_r = conn_tmp.execute(
-                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
-                        (val_coff, val_contract)
-                    ).fetchone()
-
+                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND TRIM(brand)!='' LIMIT 1",
+                        [f_coff]).fetchone()
                     brand = brand_r[0] if brand_r else ""
-                    
-                    # 4. ڈیٹا بیس کا کام ہو گیا تو کنکشن بند کر دیں
-                    conn_tmp.close()
-                    # 2. آپ کے اصلی ڈیٹا بیس کے نام (textile_inventory.db) سے کنیکٹ کرنا
-                    import sqlite3
-                    db_path = st.secrets.get("DB_URL", "textile_inventory.db")
-                    if db_path.startswith("sqlite:///"):
-                        db_path = db_path.replace("sqlite:///", "")
+                
+                    rows_po = conn_tmp.execute(
+                        "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND TRIM(po_no)!='' ORDER BY po_no",
+                        [f_coff]).fetchall()
+                    po_for_sc = [r[0] for r in rows_po]
+                
+                conn_tmp.close()
 
-                    conn_tmp = sqlite3.connect(db_path)
-
-                    # 3. برانڈ لانے کے لیے کیوری (بریکٹ بالکل صحیح بند ہیں)
-                    brand_r = conn_tmp.execute(
-                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
-                        (val_coff, val_contract)
-                    ).fetchone()
-
-                    brand = brand_r[0] if brand_r else ""
-                    
-                    # 4. اب اگلی لائن جہاں پر ایرر آرہا تھا (rows_po والی لائن)
-                    rows_po = conn_tmp.execute()
-                    val_coff = str(temp_coff) if temp_coff is not None else ""
-                    val_contract = str(temp_contract) if temp_contract is not None else ""
-
-                    # 2. آپ کے اصلی ڈیٹا بیس کے نام (textile_inventory.db) سے کنیکٹ کرنا
-                    import sqlite3
-                    import os
-
-                    # اگر آپ کلاؤڈ پر ریلائے کر رہے ہیں تو secrets سے پاتھ لیں، ورنہ لوکل فائل کا پاتھ
-                    db_path = st.secrets.get("DB_URL", "textile_inventory.db")
-                    if db_path.startswith("sqlite:///"):
-                        db_path = db_path.replace("sqlite:///", "")
-
-                    conn_tmp = sqlite3.connect(db_path)
-
-                    # 3. اب کیوری بالکل صحیح چلے گی کیونکہ ڈیٹا بیس وہی اصلی والا لوڈ ہوا ہے
-                    brand_r = conn_tmp.execute(
-                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
-                        (val_coff, val_contract)
-                    ).fetchone()
-
-                    brand = brand_r[0] if brand_r else ""
-                    conn_tmp.close()
+            with info_col:
+                if f_coff and (contracts_for_coff or po_for_sc):
                     po_display = " | ".join(po_for_sc) if po_for_sc else "—"
                     brand_display = brand if brand else "—"
                     st.markdown(f"""
@@ -1260,7 +1232,7 @@ with tab2:
                         f_po = po_for_sc[0]
                     elif len(po_for_sc) > 1:
                         f_po = st.selectbox("Select PO No. *", po_for_sc, key="dc_po_sel")
-                    elif f_coff:
+                elif f_coff:
                     st.markdown("""
                     <div class="auto-box" style="background:#7f1d1d;border:1px solid #ef4444;color:#fff; padding:6px;">
                       ⚠️ <b>Call-Off Not Found!</b>
@@ -2329,6 +2301,7 @@ with tab6:
 
                 for col in "ABCDEFG":
                     ws.column_dimensions[col].width = 18
+                _apply_grid_borders(ws)
                 buf = io.BytesIO()
                 wb.save(buf)
                 buf.seek(0)
