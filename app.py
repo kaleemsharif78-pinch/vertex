@@ -495,17 +495,6 @@ DITTO_CATEGORY_SHORT_LABELS = {
     "Eco Friendly": "Eco Stickers",
 }
 
-def _apply_grid_borders(ws):
-    """NEW ADDITION: applies a thin border around every used cell so Excel
-    exports look like a proper bordered table (matching the PDF's grid
-    lines) instead of a blank, line-less sheet."""
-    from openpyxl.styles import Border, Side
-    thin = Side(style="thin", color="000000")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-        for cell in row:
-            cell.border = border
-
 def _fmt_date_ddmmyyyy(d):
     """Prints dates as DD-MM-YYYY on all printouts, regardless of how the
     date is stored internally (kept as ISO YYYY-MM-DD in the DB itself)."""
@@ -643,8 +632,6 @@ def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, token_no, destinat
     for col_idx in range(8, 25):
         ws.column_dimensions[get_column_letter(col_idx)].width = 14
 
-    _apply_grid_borders(ws)
-
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -669,23 +656,18 @@ def _generate_ditto_dc_pdf(dc_no, call_off_no, contract_no, token_no, destinatio
     story.append(Paragraph("DELIVERY CHALLAN", center_dc))
     story.append(Spacer(1, 10))
 
+    # Keep delivery references in one balanced two-column header. The right
+    # column is stacked opposite the left details and finishes above Remarks.
     info_data = [
-        [f"Date: {ddmmyyyy}", f"Destination: {destination}"],
-        [f"Cont #{contract_no}", ""],
+        [f"Date: {ddmmyyyy}", f"DC No: {dc_no}"],
+        [f"Sale Contract: {contract_no}", f"Company Token/PO: {token_no}" if token_no else "Company Token/PO: —"],
+        ["Customer Name:  Gul Ahmed Textile Mills Limited (Karachi)", f"Call-Off No: {call_off_no}"],
+        ["", f"Destination: {destination}"],
     ]
     t_info = Table(info_data, colWidths=[270, 270])
     t_info.setStyle(TableStyle([('FONTSIZE', (0, 0), (-1, -1), 10), ('BOTTOMPADDING', (0, 0), (-1, -1), 4)]))
     story.append(t_info)
-    story.append(Paragraph("Customer Name:  Gul Ahmed Textile Mills Limited (Karachi)",
-                            ParagraphStyle('Cust', parent=styles['Normal'], fontSize=10, spaceBefore=4)))
     story.append(Spacer(1, 10))
-
-    # DC #, Company PO (Token), Call-Off — directly above the item table
-    dc_block = [[f"DC # {dc_no}", f"Company PO # {token_no}" if token_no else "Company PO # —", f"CALL OFF {call_off_no}"]]
-    t_dc = Table(dc_block, colWidths=[180, 180, 180])
-    t_dc.setStyle(TableStyle([('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'), ('FONTSIZE', (0, 0), (-1, -1), 10)]))
-    story.append(t_dc)
-    story.append(Spacer(1, 6))
 
     item_data = [["S.No", "Customer PO", "Item Code, Description, Brand", "UOM", "Quantity", "Remarks"]]
     for i, item in enumerate(items):
@@ -1179,8 +1161,6 @@ with tab2:
             if f_coff:
                 # Retrieve the contracts and articles using safe helpers
                 contracts_for_coff = get_contracts_for_calloff(f_coff)
-                art_list = q("SELECT DISTINCT article FROM sheet_orders WHERE call_off_no=? ORDER BY article", [f_coff])["article"].tolist()
-
                 if contracts_for_coff:
                     with c_sc2:
                         if len(contracts_for_coff) == 1:
@@ -1201,6 +1181,23 @@ with tab2:
                         [f_coff, f_contract]
                     )
                     po_for_sc = df_po["po_no"].tolist()
+
+                    # Hide articles already saved for this exact Call-Off and
+                    # Sale Contract, preventing a second DC entry for them.
+                    art_list = q("""
+                        SELECT DISTINCT so.article
+                        FROM sheet_orders AS so
+                        WHERE so.call_off_no=? AND so.sale_contract=?
+                          AND TRIM(so.article)!=''
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM inventory AS inv
+                              WHERE inv.call_off_no=so.call_off_no
+                                AND inv.contract_no=so.sale_contract
+                                AND inv.article=so.article
+                          )
+                        ORDER BY so.article
+                    """, [f_coff, f_contract])["article"].tolist()
                 else:
                     # Fallback when there are no contracts
                     f_contract = ""  # Safeguard downstream code from NameError
@@ -2300,7 +2297,6 @@ with tab6:
 
                 for col in "ABCDEFG":
                     ws.column_dimensions[col].width = 18
-                _apply_grid_borders(ws)
                 buf = io.BytesIO()
                 wb.save(buf)
                 buf.seek(0)
