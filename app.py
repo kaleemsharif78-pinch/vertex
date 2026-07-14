@@ -1158,7 +1158,6 @@ with tab1:
                 st.session_state.pop("gs_sel", None)
                 st.rerun()
 
-# ═══════════════════════════════════════════════
 # TAB 2 — DC ENTRY (UNCHANGED)
 # ═══════════════════════════════════════════════
 with tab2:
@@ -1177,7 +1176,7 @@ with tab2:
             f_po, f_contract, brand = "", "", ""
             contracts_for_coff, po_for_sc, art_list = [], [], []
 
-           if f_coff:
+            if f_coff:
                 # Retrieve the contracts and articles using safe helpers
                 contracts_for_coff = get_contracts_for_calloff(f_coff)
                 art_list = q("SELECT DISTINCT article FROM sheet_orders WHERE call_off_no=? ORDER BY article", [f_coff])["article"].tolist()
@@ -1204,6 +1203,8 @@ with tab2:
                     po_for_sc = df_po["po_no"].tolist()
                 else:
                     # Fallback when there are no contracts
+                    f_contract = ""  # Safeguard downstream code from NameError
+                    
                     df_brand = q(
                         "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND TRIM(brand)!='' LIMIT 1",
                         [f_coff]
