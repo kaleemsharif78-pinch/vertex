@@ -548,18 +548,22 @@ def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, token_no, destinat
     _centered(6, "DELIVERY CHALLAN", size=14, b=True)
 
     ws["B8"] = f"Date: {ddmmyyyy}"
-    ws["E8"] = f"Destination: {destination}"
     ws["B9"] = f"Cont #{contract_no}"
-    ws.merge_cells("B10:G10")
+    ws.merge_cells("B10:F10")
     ws["B10"] = "Customer Name:  Gul Ahmed Textile Mills Limited (Karachi)"
 
     # DC #, Company PO (Token), Call-Off — moved directly above the item
     # table (right above the Remarks column), as requested.
-    ws["B12"] = f"DC # {dc_no}"
+    ws["G8"] = f"DC No: {dc_no}"
+    ws["D12"] = None
     ws["D12"] = f"Company PO # {token_no}" if token_no else "Company PO # —"
-    ws["F12"] = f"CALL OFF {call_off_no}"
-    for cell in ("B12", "D12", "F12"):
+    ws["G9"] = f"Call-Off: {call_off_no}"
+    ws["D12"] = None
+    ws["G10"] = f"Destination: {destination}"
+    ws["G11"] = f"PO: {token_no}" if token_no else "PO: —"
+    for cell in ("G8", "G9", "G10", "G11"):
         ws[cell].font = bold
+    ws["G11"] = f"PO: {token_no}" if token_no else "PO: -"
 
     headers = ["S.No", "Customer PO", "Item Code, Description, Brand", "UOM", "Quantity", "Remarks"]
     for i, h in enumerate(headers):
@@ -664,7 +668,12 @@ def _generate_ditto_dc_pdf(dc_no, call_off_no, contract_no, token_no, destinatio
         ["Customer Name:  Gul Ahmed Textile Mills Limited (Karachi)", f"Call-Off No: {call_off_no}"],
         ["", f"Destination: {destination}"],
     ]
-    t_info = Table(info_data, colWidths=[270, 270])
+    # Right-side values align exactly with the 125-point Remarks column.
+    # The saved company token is intentionally printed with the label "PO".
+    info_data[1][1] = f"Call-Off: {call_off_no}"
+    info_data[2][1] = f"Destination: {destination}"
+    info_data[3][1] = f"PO: {token_no}" if token_no else "PO: —"
+    t_info = Table(info_data, colWidths=[415, 125])
     t_info.setStyle(TableStyle([('FONTSIZE', (0, 0), (-1, -1), 10), ('BOTTOMPADDING', (0, 0), (-1, -1), 4)]))
     story.append(t_info)
     story.append(Spacer(1, 10))
