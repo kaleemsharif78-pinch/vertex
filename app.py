@@ -1183,11 +1183,19 @@ with tab2:
                         else:
                             f_contract = st.selectbox("Select Contract # *", contracts_for_coff, key="dc_cont_sel")
                 
+                    # --- یہاں سے کوڈ کو اپڈیٹ کریں ---
+                    import sqlite3
+                    # اپنی ڈیٹا بیس فائل کا جو بھی نام ہے (جیسے data.db یا inventory.db)، وہ یہاں لکھیں:
+                    conn_tmp = sqlite3.connect("inventory.db") 
+                    
                     brand_r = conn_tmp.execute(
                         "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
                         [f_coff, f_contract]).fetchone()
+                    
                     brand = brand_r[0] if brand_r else ""
-
+                    
+                    # کام ختم ہونے کے بعد کنکشن بند کر دیں (اختیاری لیکن بہتر ہے)
+                    conn_tmp.close()
                     rows_po = conn_tmp.execute(
                         "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(po_no)!='' ORDER BY po_no",
                         [f_coff, f_contract]).fetchall()
