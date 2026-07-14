@@ -1177,7 +1177,7 @@ with tab2:
 
                 if contracts_for_coff:
                     with c_sc2:
-           else:
+               else:
                             f_contract = st.selectbox("Select Contract", options=[]) # آپ کا سلیکٹ باکس کوڈ یہاں ہوگا
 
                     # --- یہاں سے مستقل حل شروع ہوتا ہے ---
