@@ -1196,16 +1196,23 @@ with tab2:
                         else:
                             f_contract = st.selectbox("Select Contract # *", contracts_for_coff, key="dc_cont_sel")
                 
-                    brand_r = conn_tmp.execute(
-                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
-                        [f_coff, f_contract]).fetchone()
-                    brand = brand_r[0] if brand_r else ""
+                    conn_tmp = get_conn()
 
+                    brand_r = conn_tmp.execute(
+                            "SELECT DISTINCT brand FROM sheet_orders "
+                            "WHERE call_off_no=? AND sale_contract=? "
+                            "AND TRIM(brand)!='' LIMIT 1",
+                    [f_coff, f_contract]
+                    ).fetchone()
+
+                    conn_tmp.close()
+
+                    brand = brand_r[0] if brand_r else ""
                     rows_po = conn_tmp.execute(
                         "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(po_no)!='' ORDER BY po_no",
                         [f_coff, f_contract]).fetchall()
                     po_for_sc = [r[0] for r in rows_po]
-                else:
+                    else:
                     brand_r = conn_tmp.execute(
                         "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND TRIM(brand)!='' LIMIT 1",
                         [f_coff]).fetchone()
