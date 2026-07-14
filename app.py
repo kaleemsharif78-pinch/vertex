@@ -1177,7 +1177,7 @@ with tab2:
 
                 if contracts_for_coff:
                     with c_sc2:
-               else:
+                else:
                             f_contract = st.selectbox("Select Contract", options=[]) # آپ کا سلیکٹ باکس کوڈ یہاں ہوگا
 
                     # --- یہاں سے مستقل حل شروع ہوتا ہے ---
@@ -1260,7 +1260,7 @@ with tab2:
                         f_po = po_for_sc[0]
                     elif len(po_for_sc) > 1:
                         f_po = st.selectbox("Select PO No. *", po_for_sc, key="dc_po_sel")
-                elif f_coff:
+                    elif f_coff:
                     st.markdown("""
                     <div class="auto-box" style="background:#7f1d1d;border:1px solid #ef4444;color:#fff; padding:6px;">
                       ⚠️ <b>Call-Off Not Found!</b>
