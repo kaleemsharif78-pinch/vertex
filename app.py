@@ -1233,7 +1233,8 @@ with tab2:
                     ).fetchone()
 
                     brand = brand_r[0] if brand_r else ""
-                    conn_tmp.close()                    po_display = " | ".join(po_for_sc) if po_for_sc else "—"
+                    conn_tmp.close()
+                    po_display = " | ".join(po_for_sc) if po_for_sc else "—"
                     brand_display = brand if brand else "—"
                     st.markdown(f"""
                     <div class="auto-box" style="background:#064e3b;border:1px solid #10b981;color:#fff; padding:8px; font-size:11px;">
