@@ -1176,7 +1176,7 @@ with tab2:
                 art_list = q("SELECT DISTINCT article FROM sheet_orders WHERE call_off_no=? ORDER BY article", [f_coff])["article"].tolist()
 
                 if contracts_for_coff:
-                    with c_sc2:
+                with c_sc2:
                 else:
                             f_contract = st.selectbox("Select Contract", options=[]) # آپ کا سلیکٹ باکس کوڈ یہاں ہوگا
 
