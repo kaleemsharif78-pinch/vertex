@@ -1187,23 +1187,31 @@ with tab2:
                         "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
                         [f_coff, f_contract]).fetchone()
                     brand = brand_r[0] if brand_r else ""
-
-                    rows_po = conn_tmp.execute(
-                        "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(po_no)!='' ORDER BY po_no",
-                        [f_coff, f_contract]).fetchall()
-                    po_for_sc = [r[0] for r in rows_po]
-                else:
-                    brand_r = conn_tmp.execute(
-                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND TRIM(brand)!='' LIMIT 1",
-                        [f_coff]).fetchone()
-                    brand = brand_r[0] if brand_r else ""
-                
-                    rows_po = conn_tmp.execute(
-                        "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND TRIM(po_no)!='' ORDER BY po_no",
-                      # 1. پہلے یہ چیک کریں کہ فیلڈز خالی تو نہیں ہیں
+# 1. پہلے یہ چیک کریں کہ فیلڈز خالی تو نہیں ہیں
                     temp_coff = f_coff if 'f_coff' in locals() or 'f_coff' in globals() else ""
                     temp_contract = f_contract if 'f_contract' in locals() or 'f_contract' in globals() else ""
 
+                    val_coff = str(temp_coff) if temp_coff is not None else ""
+                    val_contract = str(temp_contract) if temp_contract is not None else ""
+
+                    # 2. آپ کے اصلی ڈیٹا بیس کے نام (textile_inventory.db) سے کنیکٹ کرنا
+                    import sqlite3
+                    db_path = st.secrets.get("DB_URL", "textile_inventory.db")
+                    if db_path.startswith("sqlite:///"):
+                        db_path = db_path.replace("sqlite:///", "")
+
+                    conn_tmp = sqlite3.connect(db_path)
+
+                    # 3. برانڈ لانے کے لیے کیوری (بریکٹ بالکل صحیح بند ہیں)
+                    brand_r = conn_tmp.execute(
+                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
+                        (val_coff, val_contract)
+                    ).fetchone()
+
+                    brand = brand_r[0] if brand_r else ""
+                    
+                    # 4. اب اگلی لائن جہاں پر ایرر آرہا تھا (rows_po والی لائن)
+                    rows_po = conn_tmp.execute(
                     val_coff = str(temp_coff) if temp_coff is not None else ""
                     val_contract = str(temp_contract) if temp_contract is not None else ""
 
