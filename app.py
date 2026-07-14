@@ -1183,42 +1183,11 @@ with tab2:
                         else:
                             f_contract = st.selectbox("Select Contract # *", contracts_for_coff, key="dc_cont_sel")
                 
-                    # --- یہاں سے کوڈ کو اپڈیٹ کریں ---
-                    import sqlite3
-                    # اپنی ڈیٹا بیس فائل کا جو بھی نام ہے (جیسے data.db یا inventory.db)، وہ یہاں لکھیں:
-                    conn_tmp = sqlite3.connect("inventory.db") 
-                # چیک کریں کہ دونوں ویری ایبلز موجود ہیں، اگر نہیں تو ان کو ڈیفالٹ سیٹ کریں
-                    if 'f_coff' not in locals() or 'f_coff' not in globals():
-                        f_coff = ""
-                    if 'f_contract' not in locals() or 'f_contract' not in globals():
-                        f_contract = ""
-
-                    # اب کیوری چلائیں تاکہ ایرر نہ آئے
-                    # 1. پہلے یہ چیک کر لیں کہ دونوں ویری ایبلز موجود ہیں یا نہیں
-                    temp_coff = f_coff if 'f_coff' in locals() or 'f_coff' in globals() else ""
-                    temp_contract = f_contract if 'f_contract' in locals() or 'f_contract' in globals() else ""
-
-                    # 2. اگر ویری ایبلز موجود ہیں لیکن ان میں None ویلیو ہے، تو انہیں خالی سٹرنگ کر دیں
-                    val_coff = str(temp_coff) if temp_coff is not None else ""
-                    val_contract = str(temp_contract) if temp_contract is not None else ""
-
-                    # 3. اب کیوری کو ٹپل (Tuple) کے ساتھ چلائیں (یہ زیادہ محفوظ طریقہ ہے)
-                    brand_r = conn_tmp.execute(
-                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
-                        (val_coff, val_contract)
-                    ).fetchone()
-
-                    brand = brand_r[0] if brand_r else ""
-                    brand = brand_r[0] if brand_r else ""
-                    
                     brand_r = conn_tmp.execute(
                         "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
                         [f_coff, f_contract]).fetchone()
-                    
                     brand = brand_r[0] if brand_r else ""
-                    
-                    # کام ختم ہونے کے بعد کنکشن بند کر دیں (اختیاری لیکن بہتر ہے)
-                    conn_tmp.close()
+
                     rows_po = conn_tmp.execute(
                         "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(po_no)!='' ORDER BY po_no",
                         [f_coff, f_contract]).fetchall()
