@@ -1177,23 +1177,37 @@ with tab2:
 
                 if contracts_for_coff:
                     with c_sc2:
-                        if len(contracts_for_coff) == 1:
-                            f_contract = contracts_for_coff[0]
-                            st.text_input("Contract # (Auto-loaded)", value=f_contract, disabled=True, key="dc_cont_ro")
-                        else:
-                            f_contract = st.selectbox("Select Contract # *", contracts_for_coff, key="dc_cont_sel")
-                
-                    brand_r = conn_tmp.execute(
-                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
-                        [f_coff, f_contract]).fetchone()
-                    brand = brand_r[0] if brand_r else ""
-# 1. پہلے یہ چیک کریں کہ فیلڈز خالی تو نہیں ہیں
+           else:
+                            f_contract = st.selectbox("Select Contract", options=[]) # آپ کا سلیکٹ باکس کوڈ یہاں ہوگا
+
+                    # --- یہاں سے مستقل حل شروع ہوتا ہے ---
+                    # 1. پہلے ڈیٹا بیس کنکشن قائم کریں تاکہ conn_tmp ہر حال میں موجود ہو
+                    import sqlite3
+                    import os
+
+                    db_path = st.secrets.get("DB_URL", "textile_inventory.db")
+                    if db_path.startswith("sqlite:///"):
+                        db_path = db_path.replace("sqlite:///", "")
+
+                    conn_tmp = sqlite3.connect(db_path)
+
+                    # 2. فیلڈز کی موجودگی کی تصدیق کریں
                     temp_coff = f_coff if 'f_coff' in locals() or 'f_coff' in globals() else ""
                     temp_contract = f_contract if 'f_contract' in locals() or 'f_contract' in globals() else ""
 
                     val_coff = str(temp_coff) if temp_coff is not None else ""
                     val_contract = str(temp_contract) if temp_contract is not None else ""
 
+                    # 3. اب برانڈ لانے کے لیے کیوری چلائیں
+                    brand_r = conn_tmp.execute(
+                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
+                        (val_coff, val_contract)
+                    ).fetchone()
+
+                    brand = brand_r[0] if brand_r else ""
+                    
+                    # 4. ڈیٹا بیس کا کام ہو گیا تو کنکشن بند کر دیں
+                    conn_tmp.close()
                     # 2. آپ کے اصلی ڈیٹا بیس کے نام (textile_inventory.db) سے کنیکٹ کرنا
                     import sqlite3
                     db_path = st.secrets.get("DB_URL", "textile_inventory.db")
