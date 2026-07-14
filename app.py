@@ -1191,19 +1191,28 @@ with tab2:
                     )
                     po_for_sc = df_po["po_no"].tolist()
 
-                    # Hide articles already saved for this exact Call-Off and
-                    # Sale Contract, preventing a second DC entry for them.
+                    # Keep an article selectable until every item category
+                    # ordered for it has been saved.  A single saved Safety
+                    # or Washing Paper row must not hide Tag/Inlay Card.
                     art_list = q("""
                         SELECT DISTINCT so.article
                         FROM sheet_orders AS so
                         WHERE so.call_off_no=? AND so.sale_contract=?
                           AND TRIM(so.article)!=''
-                          AND NOT EXISTS (
+                          AND EXISTS (
                               SELECT 1
-                              FROM inventory AS inv
-                              WHERE inv.call_off_no=so.call_off_no
-                                AND inv.contract_no=so.sale_contract
-                                AND inv.article=so.article
+                              FROM sheet_orders AS pending
+                              WHERE pending.call_off_no=so.call_off_no
+                                AND pending.sale_contract=so.sale_contract
+                                AND pending.article=so.article
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM inventory AS inv
+                                    WHERE inv.call_off_no=pending.call_off_no
+                                      AND inv.contract_no=pending.sale_contract
+                                      AND inv.article=pending.article
+                                      AND inv.category=pending.category
+                                )
                           )
                         ORDER BY so.article
                     """, [f_coff, f_contract])["article"].tolist()
