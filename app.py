@@ -1211,7 +1211,7 @@ with tab2:
                     brand = brand_r[0] if brand_r else ""
                     
                     # 4. اب اگلی لائن جہاں پر ایرر آرہا تھا (rows_po والی لائن)
-                    rows_po = conn_tmp.execute(
+                    rows_po = conn_tmp.execute()
                     val_coff = str(temp_coff) if temp_coff is not None else ""
                     val_contract = str(temp_contract) if temp_contract is not None else ""
 
