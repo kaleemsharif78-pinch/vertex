@@ -1194,11 +1194,21 @@ with tab2:
                         f_contract = ""
 
                     # اب کیوری چلائیں تاکہ ایرر نہ آئے
+                    # 1. پہلے یہ چیک کر لیں کہ دونوں ویری ایبلز موجود ہیں یا نہیں
+                    temp_coff = f_coff if 'f_coff' in locals() or 'f_coff' in globals() else ""
+                    temp_contract = f_contract if 'f_contract' in locals() or 'f_contract' in globals() else ""
+
+                    # 2. اگر ویری ایبلز موجود ہیں لیکن ان میں None ویلیو ہے، تو انہیں خالی سٹرنگ کر دیں
+                    val_coff = str(temp_coff) if temp_coff is not None else ""
+                    val_contract = str(temp_contract) if temp_contract is not None else ""
+
+                    # 3. اب کیوری کو ٹپل (Tuple) کے ساتھ چلائیں (یہ زیادہ محفوظ طریقہ ہے)
                     brand_r = conn_tmp.execute(
                         "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
-                        [str(f_coff), str(f_contract)]
+                        (val_coff, val_contract)
                     ).fetchone()
-                    
+
+                    brand = brand_r[0] if brand_r else ""
                     brand = brand_r[0] if brand_r else ""
                     
                     brand_r = conn_tmp.execute(
