@@ -1187,6 +1187,19 @@ with tab2:
                     import sqlite3
                     # اپنی ڈیٹا بیس فائل کا جو بھی نام ہے (جیسے data.db یا inventory.db)، وہ یہاں لکھیں:
                     conn_tmp = sqlite3.connect("inventory.db") 
+                # چیک کریں کہ دونوں ویری ایبلز موجود ہیں، اگر نہیں تو ان کو ڈیفالٹ سیٹ کریں
+                    if 'f_coff' not in locals() or 'f_coff' not in globals():
+                        f_coff = ""
+                    if 'f_contract' not in locals() or 'f_contract' not in globals():
+                        f_contract = ""
+
+                    # اب کیوری چلائیں تاکہ ایرر نہ آئے
+                    brand_r = conn_tmp.execute(
+                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
+                        [str(f_coff), str(f_contract)]
+                    ).fetchone()
+                    
+                    brand = brand_r[0] if brand_r else ""
                     
                     brand_r = conn_tmp.execute(
                         "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
