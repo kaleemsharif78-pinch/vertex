@@ -1177,14 +1177,8 @@ with tab2:
             f_po, f_contract, brand = "", "", ""
             contracts_for_coff, po_for_sc, art_list = [], [], []
 
-            if f_coff:
-                # BUGFIX (performance/stability): this used to open a raw
-                # connection via get_conn() and NEVER close it — on every
-                # single rerun, leaking a connection from the pool each time.
-                # With multiple concurrent users this would exhaust the pool
-                # and cause exactly the lock/slowness symptoms reported.
-                # Now uses q() (which always closes its connection) plus the
-                # cached contract lookup.
+           if f_coff:
+                # Retrieve the contracts and articles using safe helpers
                 contracts_for_coff = get_contracts_for_calloff(f_coff)
                 art_list = q("SELECT DISTINCT article FROM sheet_orders WHERE call_off_no=? ORDER BY article", [f_coff])["article"].tolist()
 
@@ -1196,27 +1190,31 @@ with tab2:
                         else:
                             f_contract = st.selectbox("Select Contract # *", contracts_for_coff, key="dc_cont_sel")
                 
-                    brand_r = conn_tmp.execute(
+                    # Safe query using q() helper instead of raw conn_tmp execution
+                    df_brand = q(
                         "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
-                        [f_coff, f_contract]).fetchone()
-                    brand = brand_r[0] if brand_r else ""
+                        [f_coff, f_contract]
+                    )
+                    brand = df_brand.iloc[0]["brand"] if not df_brand.empty else ""
 
-                    rows_po = conn_tmp.execute(
+                    df_po = q(
                         "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(po_no)!='' ORDER BY po_no",
-                        [f_coff, f_contract]).fetchall()
-                    po_for_sc = [r[0] for r in rows_po]
+                        [f_coff, f_contract]
+                    )
+                    po_for_sc = df_po["po_no"].tolist()
                 else:
-                    brand_r = conn_tmp.execute(
+                    # Fallback when there are no contracts
+                    df_brand = q(
                         "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND TRIM(brand)!='' LIMIT 1",
-                        [f_coff]).fetchone()
-                    brand = brand_r[0] if brand_r else ""
+                        [f_coff]
+                    )
+                    brand = df_brand.iloc[0]["brand"] if not df_brand.empty else ""
                 
-                    rows_po = conn_tmp.execute(
+                    df_po = q(
                         "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND TRIM(po_no)!='' ORDER BY po_no",
-                        [f_coff]).fetchall()
-                    po_for_sc = [r[0] for r in rows_po]
-                
-                conn_tmp.close()
+                        [f_coff]
+                    )
+                    po_for_sc = df_po["po_no"].tolist()
 
             with info_col:
                 if f_coff and (contracts_for_coff or po_for_sc):
