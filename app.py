@@ -1200,14 +1200,32 @@ with tab2:
                 
                     rows_po = conn_tmp.execute(
                         "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND TRIM(po_no)!='' ORDER BY po_no",
-                        [f_coff]).fetchall()
-                    po_for_sc = [r[0] for r in rows_po]
-                
-                conn_tmp.close()
+                      # 1. پہلے یہ چیک کریں کہ فیلڈز خالی تو نہیں ہیں
+                    temp_coff = f_coff if 'f_coff' in locals() or 'f_coff' in globals() else ""
+                    temp_contract = f_contract if 'f_contract' in locals() or 'f_contract' in globals() else ""
 
-            with info_col:
-                if f_coff and (contracts_for_coff or po_for_sc):
-                    po_display = " | ".join(po_for_sc) if po_for_sc else "—"
+                    val_coff = str(temp_coff) if temp_coff is not None else ""
+                    val_contract = str(temp_contract) if temp_contract is not None else ""
+
+                    # 2. آپ کے اصلی ڈیٹا بیس کے نام (textile_inventory.db) سے کنیکٹ کرنا
+                    import sqlite3
+                    import os
+
+                    # اگر آپ کلاؤڈ پر ریلائے کر رہے ہیں تو secrets سے پاتھ لیں، ورنہ لوکل فائل کا پاتھ
+                    db_path = st.secrets.get("DB_URL", "textile_inventory.db")
+                    if db_path.startswith("sqlite:///"):
+                        db_path = db_path.replace("sqlite:///", "")
+
+                    conn_tmp = sqlite3.connect(db_path)
+
+                    # 3. اب کیوری بالکل صحیح چلے گی کیونکہ ڈیٹا بیس وہی اصلی والا لوڈ ہوا ہے
+                    brand_r = conn_tmp.execute(
+                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
+                        (val_coff, val_contract)
+                    ).fetchone()
+
+                    brand = brand_r[0] if brand_r else ""
+                    conn_tmp.close()                    po_display = " | ".join(po_for_sc) if po_for_sc else "—"
                     brand_display = brand if brand else "—"
                     st.markdown(f"""
                     <div class="auto-box" style="background:#064e3b;border:1px solid #10b981;color:#fff; padding:8px; font-size:11px;">
