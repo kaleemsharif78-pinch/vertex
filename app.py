@@ -7,6 +7,7 @@ import math
 import hashlib
 import secrets as pysecrets
 import base64
+import json
 from datetime import date
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -184,6 +185,9 @@ def _init_schema():
         ("idx_so_article_category",  "sheet_orders(article, category)"),
         ("idx_so_contract",          "sheet_orders(sale_contract)"),
         ("idx_so_po",                "sheet_orders(po_no)"),
+        ("idx_so_dc_article_cat",    "sheet_orders(call_off_no, sale_contract, article, category)"),
+        ("idx_inv_dc_lines",         "inventory(dc_no, id)"),
+        ("idx_inv_dc_article_cat",   "inventory(call_off_no, contract_no, article, category)"),
         ("idx_bilty_calloff_art",    "bilty(call_off_no, article, category)"),
         ("idx_bilty_contract",       "bilty(contract_no)"),
     ]
@@ -319,6 +323,7 @@ def get_bilty_qty(call_off_no, article, category=None):
         extra = " AND category=?"; params.append(category)
     return scalar(f"SELECT SUM(qty) FROM bilty WHERE call_off_no=? AND article=?{extra}", params)
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_item_description(article, category):
     """Looks up the last exact PO wording an operator typed for this
     Article+Category (e.g. 'INLAY CARD FITTED 36.5X40.5 CM- DIXX JERSEY'),
@@ -336,6 +341,14 @@ def save_cached_item_description(article, category, description):
     conn.execute("INSERT INTO item_desc_cache (article, category, description) VALUES (?,?,?)", (article, category, description.strip()))
     conn.commit()
     conn.close()
+    get_cached_item_description.clear()
+
+def autofill_item_description(widget_key, source_key, article, category):
+    """Refresh a description field only when its selected item changes."""
+    selection = (str(article or ""), str(category or ""))
+    if st.session_state.get(source_key) != selection:
+        st.session_state[widget_key] = get_cached_item_description(article, category)
+        st.session_state[source_key] = selection
 
 def round_and_format(val):
     try:
@@ -509,6 +522,10 @@ def _fmt_date_ddmmyyyy(d):
 
 def _dc_article_matrix(items):
     cats_present = sorted({i["category"] for i in items if i["category"] not in DITTO_GLOBAL_CATEGORIES})
+    # Consolidated DC exports intentionally suppress the old article-by-article
+    # matrix; category totals are shown instead.
+    if items and all(i.get("summary_only") for i in items):
+        return [], [], {}
     arts_present = sorted({i["article"] for i in items})
     matrix = {a: {c: 0.0 for c in cats_present} for a in arts_present}
     for i in items:
@@ -548,20 +565,24 @@ def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, token_no, destinat
     _centered(6, "DELIVERY CHALLAN", size=14, b=True)
 
     ws["B8"] = f"Date: {ddmmyyyy}"
-    ws["E8"] = f"Destination: {destination}"
     ws["B9"] = f"Cont #{contract_no}"
-    ws.merge_cells("B10:G10")
+    ws.merge_cells("B10:F10")
     ws["B10"] = "Customer Name:  Gul Ahmed Textile Mills Limited (Karachi)"
 
     # DC #, Company PO (Token), Call-Off — moved directly above the item
     # table (right above the Remarks column), as requested.
-    ws["B12"] = f"DC # {dc_no}"
+    ws["G8"] = f"DC No: {dc_no}"
+    ws["D12"] = None
     ws["D12"] = f"Company PO # {token_no}" if token_no else "Company PO # —"
-    ws["F12"] = f"CALL OFF {call_off_no}"
-    for cell in ("B12", "D12", "F12"):
+    ws["G9"] = f"Call-Off: {call_off_no}"
+    ws["D12"] = None
+    ws["G10"] = f"Destination: {destination}"
+    ws["G11"] = f"PO: {token_no}" if token_no else "PO: —"
+    for cell in ("G8", "G9", "G10", "G11"):
         ws[cell].font = bold
+    ws["G11"] = f"PO: {token_no}" if token_no else "PO: -"
 
-    headers = ["S.No", "Customer PO", "Item Code, Description, Brand", "UOM", "Quantity", "Remarks"]
+    headers = ["S.No", "Customer PO", "Item Type / Description (as per PO)", "UOM", "Quantity", "Remarks"]
     for i, h in enumerate(headers):
         ws.cell(row=13, column=2 + i, value=h).font = bold
 
@@ -581,40 +602,9 @@ def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, token_no, destinat
     r = 14 + n_slots + 2
     cat_totals = _dc_category_totals(items)
     for cat, tot in cat_totals.items():
-        ws.cell(row=r, column=4, value=f"{cat} Total").font = bold
-        ws.cell(row=r, column=6, value=tot)
+        ws.cell(row=r, column=4, value=f"{cat} Total: {round_and_format(tot)} Pcs").font = bold
         r += 1
     r += 1
-
-    cats_present, arts_present, matrix = _dc_article_matrix(items)
-    if arts_present:
-        # NEW ADDITION: same side-by-side column-block layout as the PDF —
-        # long article lists spread into 2-3 column groups placed next to
-        # each other (instead of one long vertical list) so the printed
-        # sheet stays compact and single-page-friendly.
-        n = len(arts_present)
-        n_cols = 1 if n <= 8 else (2 if n <= 16 else 3)
-        chunk_size = math.ceil(n / n_cols)
-        chunks = [arts_present[i:i + chunk_size] for i in range(0, n, chunk_size)]
-
-        ws.cell(row=r, column=4, value="Article-Wise Summary").font = bold
-        aw_title_row = r
-        r += 1
-        block_start_row = r
-        col_offset = 4  # starting column D; each block takes (1 + len(cats_present)) columns, + 1 gap
-        for chunk in chunks:
-            rr = block_start_row
-            ws.cell(row=rr, column=col_offset, value="Article #").font = bold
-            for ci, cat in enumerate(cats_present):
-                ws.cell(row=rr, column=col_offset + 1 + ci, value=DITTO_CATEGORY_SHORT_LABELS.get(cat, cat)).font = bold
-            rr += 1
-            for art in chunk:
-                ws.cell(row=rr, column=col_offset, value=art)
-                for ci, cat in enumerate(cats_present):
-                    ws.cell(row=rr, column=col_offset + 1 + ci, value=matrix[art][cat])
-                rr += 1
-            col_offset += len(cats_present) + 2  # +2 leaves a blank gap column between blocks
-        r = block_start_row + chunk_size + 2
 
     # Footer: Prepared By + Receiver acknowledgement block, at the bottom
     r += 3
@@ -626,11 +616,6 @@ def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, token_no, destinat
 
     for col, w in {"B": 12, "C": 14, "D": 42, "E": 12, "F": 12, "G": 18}.items():
         ws.column_dimensions[col].width = w
-    # Side-by-side Article-Wise blocks can extend well past column G — give
-    # the rest of the used columns a sensible default width too.
-    from openpyxl.utils import get_column_letter
-    for col_idx in range(8, 25):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 14
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -664,12 +649,17 @@ def _generate_ditto_dc_pdf(dc_no, call_off_no, contract_no, token_no, destinatio
         ["Customer Name:  Gul Ahmed Textile Mills Limited (Karachi)", f"Call-Off No: {call_off_no}"],
         ["", f"Destination: {destination}"],
     ]
-    t_info = Table(info_data, colWidths=[270, 270])
+    # Right-side values align exactly with the 125-point Remarks column.
+    # The saved company token is intentionally printed with the label "PO".
+    info_data[1][1] = f"Call-Off: {call_off_no}"
+    info_data[2][1] = f"Destination: {destination}"
+    info_data[3][1] = f"PO: {token_no}" if token_no else "PO: —"
+    t_info = Table(info_data, colWidths=[415, 125])
     t_info.setStyle(TableStyle([('FONTSIZE', (0, 0), (-1, -1), 10), ('BOTTOMPADDING', (0, 0), (-1, -1), 4)]))
     story.append(t_info)
     story.append(Spacer(1, 10))
 
-    item_data = [["S.No", "Customer PO", "Item Code, Description, Brand", "UOM", "Quantity", "Remarks"]]
+    item_data = [["S.No", "Customer PO", "Item Type / Description (as per PO)", "UOM", "Quantity", "Remarks"]]
     for i, item in enumerate(items):
         item_data.append([i + 1, item.get("customer_po", ""), item.get("description", ""),
                            "Nos", round_and_format(item.get("qty") or 0), item.get("remark", "")])
@@ -743,6 +733,18 @@ def _generate_ditto_dc_pdf(dc_no, call_off_no, contract_no, token_no, destinatio
     buffer.seek(0)
     return buffer
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _build_ditto_dc_exports(dc_no, call_off_no, contract_no, token_no, destination,
+                            entry_date, items_json, filename_base, prepared_by):
+    """Build each unchanged DC once; Streamlit reruns then reuse the bytes."""
+    items = json.loads(items_json)
+    pdf = _generate_ditto_dc_pdf(
+        dc_no, call_off_no, contract_no, token_no, destination, entry_date, items, prepared_by)
+    xlsx = _generate_ditto_dc_excel(
+        dc_no, call_off_no, contract_no, token_no, destination, entry_date, items,
+        filename_base, prepared_by)
+    return pdf.getvalue(), xlsx.getvalue()
+
 def render_ditto_dc_section(key_prefix, default_dc=None):
     """Reusable Ditto DC preview/export block — used identically from both
     the DC Entry tab and the All Entries tab."""
@@ -774,56 +776,66 @@ def render_ditto_dc_section(key_prefix, default_dc=None):
     dc_dest = hdr["destination"] if str(hdr["destination"]).strip() else ""
 
     # ═══════════════════════════════════════════════
-    # NEW ADDITION: for any row whose description/category contains
-    # "Inlay Card" or "Band Roll", consolidate all matching rows for that
-    # exact Article + Category into ONE line, with the Remarks box showing
-    # the Normal/Topper/Split style breakdown instead of the free-text
-    # remark. All other rows are completely untouched.
+    # BUGFIX: rows were duplicating per-article because (a) the fallback
+    # description embeds the article number when no custom description was
+    # saved, and (b) a second grouping pass keyed on that already-unique
+    # text — which never matched across articles — then prepended the
+    # category name AGAIN ("Inlay Card / Bandrolle: Inlay Card / Bandrolle
+    # — Article 200991"). Fixed by consolidating ONCE, purely by
+    # (category, description), dropping article from the key entirely so
+    # the SAME accessory dispatched under different articles correctly
+    # collapses into a single summed row — matching the client's reference
+    # DC sample (one row per distinct item, no article-wise repetition).
     # ═══════════════════════════════════════════════
     def _is_inlay_or_bandroll(desc, cat):
         t = f"{desc} {cat}".lower()
         return "inlay card" in t or "band roll" in t
 
     raw_rows = df_dc_lines.to_dict("records")
-    consolidated, seen_keys, other_rows = [], set(), []
+    grouped = {}
     for r in raw_rows:
-        desc = str(r["item_description"]).strip() or f"{r['category']} — Article {r['article']}"
-        if _is_inlay_or_bandroll(desc, r["category"]):
-            key = (r["article"], r["category"], desc)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            group = [g for g in raw_rows if (g["article"], g["category"]) == (r["article"], r["category"]) and
-                     (str(g["item_description"]).strip() or f"{g['category']} — Article {g['article']}") == desc]
-            style_totals = {"Normal": 0.0, "Topper": 0.0, "Split": 0.0}
-            for g in group:
-                st_type = str(g.get("style_type") or "Normal").strip()
-                if st_type not in style_totals:
-                    st_type = "Normal"
-                style_totals[st_type] += float(g["qty"] or 0)
-            total_qty = sum(style_totals.values())
-            remark_breakdown = f"Normal: {int(style_totals['Normal']):,} | Topper: {int(style_totals['Topper']):,} | Split: {int(style_totals['Split']):,}"
-            consolidated.append({
-                "customer_po": r["po_no"], "description": desc, "qty": total_qty,
-                "remark": remark_breakdown, "category": r["category"], "article": r["article"],
-            })
-        else:
-            other_rows.append(r)
+        desc = str(r["item_description"]).strip() or str(r["category"])
+        key = (r["category"], desc)
+        if key not in grouped:
+            grouped[key] = {
+                "customer_po": r["po_no"], "description": desc, "qty": 0.0,
+                "remarks": [], "category": r["category"], "article": "",
+                "style_totals": {"Normal": 0.0, "Topper": 0.0, "Split": 0.0},
+                "is_inlay": _is_inlay_or_bandroll(desc, r["category"]),
+            }
+        grouped[key]["qty"] += float(r["qty"] or 0)
+        rmk = str(r["remark"] or "").strip()
+        if rmk and rmk not in grouped[key]["remarks"]:
+            grouped[key]["remarks"].append(rmk)
+        st_type = str(r.get("style_type") or "Normal").strip()
+        if st_type not in grouped[key]["style_totals"]:
+            st_type = "Normal"
+        grouped[key]["style_totals"][st_type] += float(r["qty"] or 0)
 
-    line_items = consolidated + [{
-        "customer_po": r["po_no"],
-        "description": (str(r["item_description"]).strip() or f"{r['category']} — Article {r['article']}"),
-        "qty": r["qty"], "remark": r["remark"],
-        "category": r["category"], "article": r["article"],
-    } for r in other_rows]
+    line_items = []
+    for g in grouped.values():
+        if g["is_inlay"]:
+            s = g["style_totals"]
+            remark = f"Normal: {int(s['Normal']):,} | Topper: {int(s['Topper']):,} | Split: {int(s['Split']):,}"
+        else:
+            remark = " | ".join(g["remarks"])
+        line_items.append({
+            "customer_po": g["customer_po"], "description": g["description"], "qty": g["qty"],
+            "remark": remark, "category": g["category"], "article": g["article"],
+        })
+
 
     ditto_filename_base = f"DC-{ditto_dc_sel}_GulAhmed_{_fmt_date_ddmmyyyy(hdr['entry_date'])}_Cont-{hdr['contract_no']}"
     st.markdown(f"**📄 File Name:** `{ditto_filename_base}`")
 
     prepared_by = current_user["full_name"] if current_user else "—"
 
-    ditto_pdf_buf = _generate_ditto_dc_pdf(ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], dc_token, dc_dest, hdr["entry_date"], line_items, prepared_by)
-    ditto_xlsx_buf = _generate_ditto_dc_excel(ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], dc_token, dc_dest, hdr["entry_date"], line_items, ditto_filename_base, prepared_by)
+    items_json = json.dumps(line_items, sort_keys=True, default=str)
+    pdf_bytes, xlsx_bytes = _build_ditto_dc_exports(
+        ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], dc_token, dc_dest,
+        str(hdr["entry_date"]), items_json, ditto_filename_base, prepared_by)
+    ditto_pdf_buf = io.BytesIO(pdf_bytes)
+    ditto_xlsx_buf = io.BytesIO(xlsx_bytes)
 
     st.markdown("##### 👁️ Live Print Preview")
     b64_pdf = base64.b64encode(ditto_pdf_buf.getvalue()).decode()
@@ -1182,19 +1194,28 @@ with tab2:
                     )
                     po_for_sc = df_po["po_no"].tolist()
 
-                    # Hide articles already saved for this exact Call-Off and
-                    # Sale Contract, preventing a second DC entry for them.
+                    # Keep an article selectable until every item category
+                    # ordered for it has been saved.  A single saved Safety
+                    # or Washing Paper row must not hide Tag/Inlay Card.
                     art_list = q("""
                         SELECT DISTINCT so.article
                         FROM sheet_orders AS so
                         WHERE so.call_off_no=? AND so.sale_contract=?
                           AND TRIM(so.article)!=''
-                          AND NOT EXISTS (
+                          AND EXISTS (
                               SELECT 1
-                              FROM inventory AS inv
-                              WHERE inv.call_off_no=so.call_off_no
-                                AND inv.contract_no=so.sale_contract
-                                AND inv.article=so.article
+                              FROM sheet_orders AS pending
+                              WHERE pending.call_off_no=so.call_off_no
+                                AND pending.sale_contract=so.sale_contract
+                                AND pending.article=so.article
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM inventory AS inv
+                                    WHERE inv.call_off_no=pending.call_off_no
+                                      AND inv.contract_no=pending.sale_contract
+                                      AND inv.article=pending.article
+                                      AND inv.category=pending.category
+                                )
                           )
                         ORDER BY so.article
                     """, [f_coff, f_contract])["article"].tolist()
@@ -1311,22 +1332,25 @@ with tab2:
                 if is_dual_pack:
                     st.caption("🧵 Dual-Pack Contract — enter Jersey & Molton separately:")
                     dp_j_art = st.selectbox("Jersey Article", dp_jersey_articles, key="dc_dp_j_art")
+                    autofill_item_description("dc_desc_jersey", "dc_desc_jersey_source", dp_j_art, f_type)
                     f_desc_jersey = st.text_input(
                         "Jersey Item Description (as per PO)",
-                        value=get_cached_item_description(dp_j_art, f_type), key="dc_desc_jersey",
+                        key="dc_desc_jersey",
                         placeholder="e.g. INLAY CARD FITTED 36.5X40.5 CM- DIXX JERSEY")
                     f_qty_jersey = st.number_input("Jersey Qty (Pcs)", min_value=0.0, step=1.0, format="%g", key="dc_qty_jersey")
                     dp_m_art = st.selectbox("Molton Article", dp_molton_articles, key="dc_dp_m_art")
+                    autofill_item_description("dc_desc_molton", "dc_desc_molton_source", dp_m_art, f_type)
                     f_desc_molton = st.text_input(
                         "Molton Item Description (as per PO)",
-                        value=get_cached_item_description(dp_m_art, f_type), key="dc_desc_molton",
+                        key="dc_desc_molton",
                         placeholder="e.g. INLAY CARD FITTED 19.29X14.37 CM- DIXX MOLTON")
                     f_qty_molton = st.number_input("Molton Qty (Pcs)", min_value=0.0, step=1.0, format="%g", key="dc_qty_molton")
                     f_qty = 0.0  # existing single-flow field unused in dual-pack mode
                 else:
+                    autofill_item_description("dc_desc", "dc_desc_source", f_art, f_type)
                     f_desc = st.text_input(
                         "Item Description (as per PO)",
-                        value=get_cached_item_description(f_art, f_type), key="dc_desc",
+                        key="dc_desc",
                         placeholder="e.g. SAFETY STICKER TRANSPARENT (5X1.5 CM) - BH")
                     f_qty = st.number_input("Quantity (Pcs) *", min_value=0.0, step=1.0, format="%g", key="dc_qty")
                     f_qty_jersey = f_qty_molton = 0.0
