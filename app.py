@@ -7,6 +7,7 @@ import math
 import hashlib
 import secrets as pysecrets
 import base64
+import json
 from datetime import date
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -184,6 +185,9 @@ def _init_schema():
         ("idx_so_article_category",  "sheet_orders(article, category)"),
         ("idx_so_contract",          "sheet_orders(sale_contract)"),
         ("idx_so_po",                "sheet_orders(po_no)"),
+        ("idx_so_dc_article_cat",    "sheet_orders(call_off_no, sale_contract, article, category)"),
+        ("idx_inv_dc_lines",         "inventory(dc_no, id)"),
+        ("idx_inv_dc_article_cat",   "inventory(call_off_no, contract_no, article, category)"),
         ("idx_bilty_calloff_art",    "bilty(call_off_no, article, category)"),
         ("idx_bilty_contract",       "bilty(contract_no)"),
     ]
@@ -319,6 +323,7 @@ def get_bilty_qty(call_off_no, article, category=None):
         extra = " AND category=?"; params.append(category)
     return scalar(f"SELECT SUM(qty) FROM bilty WHERE call_off_no=? AND article=?{extra}", params)
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_item_description(article, category):
     """Looks up the last exact PO wording an operator typed for this
     Article+Category (e.g. 'INLAY CARD FITTED 36.5X40.5 CM- DIXX JERSEY'),
@@ -336,6 +341,14 @@ def save_cached_item_description(article, category, description):
     conn.execute("INSERT INTO item_desc_cache (article, category, description) VALUES (?,?,?)", (article, category, description.strip()))
     conn.commit()
     conn.close()
+    get_cached_item_description.clear()
+
+def autofill_item_description(widget_key, source_key, article, category):
+    """Refresh a description field only when its selected item changes."""
+    selection = (str(article or ""), str(category or ""))
+    if st.session_state.get(source_key) != selection:
+        st.session_state[widget_key] = get_cached_item_description(article, category)
+        st.session_state[source_key] = selection
 
 def round_and_format(val):
     try:
@@ -509,6 +522,10 @@ def _fmt_date_ddmmyyyy(d):
 
 def _dc_article_matrix(items):
     cats_present = sorted({i["category"] for i in items if i["category"] not in DITTO_GLOBAL_CATEGORIES})
+    # Consolidated DC exports intentionally suppress the old article-by-article
+    # matrix; category totals are shown instead.
+    if items and all(i.get("summary_only") for i in items):
+        return [], [], {}
     arts_present = sorted({i["article"] for i in items})
     matrix = {a: {c: 0.0 for c in cats_present} for a in arts_present}
     for i in items:
@@ -565,7 +582,7 @@ def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, token_no, destinat
         ws[cell].font = bold
     ws["G11"] = f"PO: {token_no}" if token_no else "PO: -"
 
-    headers = ["S.No", "Customer PO", "Item Code, Description, Brand", "UOM", "Quantity", "Remarks"]
+    headers = ["S.No", "Customer PO", "Item Type / Description (as per PO)", "UOM", "Quantity", "Remarks"]
     for i, h in enumerate(headers):
         ws.cell(row=13, column=2 + i, value=h).font = bold
 
@@ -678,7 +695,7 @@ def _generate_ditto_dc_pdf(dc_no, call_off_no, contract_no, token_no, destinatio
     story.append(t_info)
     story.append(Spacer(1, 10))
 
-    item_data = [["S.No", "Customer PO", "Item Code, Description, Brand", "UOM", "Quantity", "Remarks"]]
+    item_data = [["S.No", "Customer PO", "Item Type / Description (as per PO)", "UOM", "Quantity", "Remarks"]]
     for i, item in enumerate(items):
         item_data.append([i + 1, item.get("customer_po", ""), item.get("description", ""),
                            "Nos", round_and_format(item.get("qty") or 0), item.get("remark", "")])
@@ -751,6 +768,18 @@ def _generate_ditto_dc_pdf(dc_no, call_off_no, contract_no, token_no, destinatio
     doc.build(story)
     buffer.seek(0)
     return buffer
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _build_ditto_dc_exports(dc_no, call_off_no, contract_no, token_no, destination,
+                            entry_date, items_json, filename_base, prepared_by):
+    """Build each unchanged DC once; Streamlit reruns then reuse the bytes."""
+    items = json.loads(items_json)
+    pdf = _generate_ditto_dc_pdf(
+        dc_no, call_off_no, contract_no, token_no, destination, entry_date, items, prepared_by)
+    xlsx = _generate_ditto_dc_excel(
+        dc_no, call_off_no, contract_no, token_no, destination, entry_date, items,
+        filename_base, prepared_by)
+    return pdf.getvalue(), xlsx.getvalue()
 
 def render_ditto_dc_section(key_prefix, default_dc=None):
     """Reusable Ditto DC preview/export block — used identically from both
@@ -826,13 +855,40 @@ def render_ditto_dc_section(key_prefix, default_dc=None):
         "category": r["category"], "article": r["article"],
     } for r in other_rows]
 
+    # Consolidate the export by PO, item type, and its saved PO description.
+    grouped_lines = {}
+    for item in line_items:
+        key = (str(item.get("customer_po") or ""), str(item.get("category") or ""),
+               str(item.get("description") or ""))
+        if key not in grouped_lines:
+            grouped_lines[key] = {
+                "customer_po": key[0],
+                "description": f"{key[1]}: {key[2]}",
+                "qty": 0.0,
+                "remarks": [],
+                "category": key[1],
+                "article": "",
+                "summary_only": True,
+            }
+        grouped_lines[key]["qty"] += float(item.get("qty") or 0)
+        remark = str(item.get("remark") or "").strip()
+        if remark and remark not in grouped_lines[key]["remarks"]:
+            grouped_lines[key]["remarks"].append(remark)
+    line_items = list(grouped_lines.values())
+    for item in line_items:
+        item["remark"] = " | ".join(item.pop("remarks"))
+
     ditto_filename_base = f"DC-{ditto_dc_sel}_GulAhmed_{_fmt_date_ddmmyyyy(hdr['entry_date'])}_Cont-{hdr['contract_no']}"
     st.markdown(f"**📄 File Name:** `{ditto_filename_base}`")
 
     prepared_by = current_user["full_name"] if current_user else "—"
 
-    ditto_pdf_buf = _generate_ditto_dc_pdf(ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], dc_token, dc_dest, hdr["entry_date"], line_items, prepared_by)
-    ditto_xlsx_buf = _generate_ditto_dc_excel(ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], dc_token, dc_dest, hdr["entry_date"], line_items, ditto_filename_base, prepared_by)
+    items_json = json.dumps(line_items, sort_keys=True, default=str)
+    pdf_bytes, xlsx_bytes = _build_ditto_dc_exports(
+        ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], dc_token, dc_dest,
+        str(hdr["entry_date"]), items_json, ditto_filename_base, prepared_by)
+    ditto_pdf_buf = io.BytesIO(pdf_bytes)
+    ditto_xlsx_buf = io.BytesIO(xlsx_bytes)
 
     st.markdown("##### 👁️ Live Print Preview")
     b64_pdf = base64.b64encode(ditto_pdf_buf.getvalue()).decode()
@@ -1329,22 +1385,25 @@ with tab2:
                 if is_dual_pack:
                     st.caption("🧵 Dual-Pack Contract — enter Jersey & Molton separately:")
                     dp_j_art = st.selectbox("Jersey Article", dp_jersey_articles, key="dc_dp_j_art")
+                    autofill_item_description("dc_desc_jersey", "dc_desc_jersey_source", dp_j_art, f_type)
                     f_desc_jersey = st.text_input(
                         "Jersey Item Description (as per PO)",
-                        value=get_cached_item_description(dp_j_art, f_type), key="dc_desc_jersey",
+                        key="dc_desc_jersey",
                         placeholder="e.g. INLAY CARD FITTED 36.5X40.5 CM- DIXX JERSEY")
                     f_qty_jersey = st.number_input("Jersey Qty (Pcs)", min_value=0.0, step=1.0, format="%g", key="dc_qty_jersey")
                     dp_m_art = st.selectbox("Molton Article", dp_molton_articles, key="dc_dp_m_art")
+                    autofill_item_description("dc_desc_molton", "dc_desc_molton_source", dp_m_art, f_type)
                     f_desc_molton = st.text_input(
                         "Molton Item Description (as per PO)",
-                        value=get_cached_item_description(dp_m_art, f_type), key="dc_desc_molton",
+                        key="dc_desc_molton",
                         placeholder="e.g. INLAY CARD FITTED 19.29X14.37 CM- DIXX MOLTON")
                     f_qty_molton = st.number_input("Molton Qty (Pcs)", min_value=0.0, step=1.0, format="%g", key="dc_qty_molton")
                     f_qty = 0.0  # existing single-flow field unused in dual-pack mode
                 else:
+                    autofill_item_description("dc_desc", "dc_desc_source", f_art, f_type)
                     f_desc = st.text_input(
                         "Item Description (as per PO)",
-                        value=get_cached_item_description(f_art, f_type), key="dc_desc",
+                        key="dc_desc",
                         placeholder="e.g. SAFETY STICKER TRANSPARENT (5X1.5 CM) - BH")
                     f_qty = st.number_input("Quantity (Pcs) *", min_value=0.0, step=1.0, format="%g", key="dc_qty")
                     f_qty_jersey = f_qty_molton = 0.0
