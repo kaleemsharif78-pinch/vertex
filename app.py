@@ -161,6 +161,33 @@ def _init_schema():
             for col in missing_so_cols:
                 conn.execute(text(f"ALTER TABLE sheet_orders ADD COLUMN {col} TEXT DEFAULT ''"))
 
+    # PHASE 2b — NEW ADDITION: rider_expenses table, powers the "💸 Daily
+    # Expenses / Staff Expense" tab. bill_image stores the receipt photo
+    # (camera capture or gallery upload) as raw bytes — dialect-aware type
+    # since "BLOB" isn't valid on Postgres (needs BYTEA) or ideal on MySQL
+    # (LONGBLOB, since a phone photo can exceed MySQL's plain BLOB 64KB cap).
+    if dialect == "postgresql":
+        blob_type = "BYTEA"
+    elif dialect == "mysql":
+        blob_type = "LONGBLOB"
+    else:
+        blob_type = "BLOB"
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS rider_expenses (
+                id {pk},
+                date TEXT, user_id TEXT, entered_by TEXT, category TEXT,
+                amount REAL, reference_no TEXT, remarks TEXT,
+                bill_image {blob_type})"""))
+    # Column migration for rider_expenses, same isolated-transaction pattern
+    # used for inventory above — safe to re-run, only fires if missing.
+    re_cols = [c["name"] for c in insp.get_columns("rider_expenses")]
+    missing_re_cols = [c for c in ["bill_image"] if c not in re_cols]
+    if missing_re_cols:
+        with engine.begin() as conn:
+            for col in missing_re_cols:
+                conn.execute(text(f"ALTER TABLE rider_expenses ADD COLUMN {col} {blob_type}"))
+
     # PHASE 3 — indexes. BUGFIX: these used to run in the SAME transaction as
     # everything else, wrapped in a per-statement try/except. On PostgreSQL,
     # one failed statement (e.g. index already exists) poisons the WHOLE
@@ -190,6 +217,8 @@ def _init_schema():
         ("idx_inv_dc_article_cat",   "inventory(call_off_no, contract_no, article, category)"),
         ("idx_bilty_calloff_art",    "bilty(call_off_no, article, category)"),
         ("idx_bilty_contract",       "bilty(contract_no)"),
+        ("idx_rexp_user_date",       "rider_expenses(user_id, date)"),
+        ("idx_rexp_category",        "rider_expenses(category)"),
     ]
     if dialect == "mysql":
         for name, target in index_defs:
@@ -269,6 +298,16 @@ ITEM_TYPES = [
 
 STYLES_INLAY = ["Normal", "Topper", "Split"]
 
+# NEW ADDITION: categories for the "💸 Daily Expenses / Staff Expense" tab.
+EXPENSE_CATEGORIES = [
+    "Bike Fuel (پٹرول)",
+    "Bike Maintenance (بائیک مرمت)",
+    "Bilty/Vehicle Rent (بلٹی گاڑی کرایہ)",
+    "Loading Wages (لوڈنگ مزدوری)",
+    "Advance Salary (ایڈوانس سیلری)",
+    "Miscellaneous (متفرق)",
+]
+
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
@@ -302,12 +341,22 @@ def get_contracts_for_calloff(call_off_no):
         [call_off_no]
     )["sale_contract"].tolist()
 
+# PERFORMANCE FIX (DC Entry 5-8 min lag): these three lookups fire on every
+# single Streamlit rerun — which means every keystroke in Step 1/2 — and
+# each one used to be a brand-new network round-trip to the DB. With ~7
+# item types × 2 lookups plus the article/bilty checks, that's 20-30+ fresh
+# round-trips per keystroke. Short-TTL caching collapses repeat calls with
+# identical arguments (the overwhelming majority within one typing burst)
+# down to a single DB hit. Cache is cleared immediately after any Save so
+# the just-entered figures are reflected instantly, not after the 8s TTL.
+@st.cache_data(ttl=8, show_spinner=False)
 def get_ordered_qty(article, category, coff=None, po=None):
     params, extra = [article, category], ""
     if coff: extra += " AND call_off_no=?"; params.append(coff)
     if po:   extra += " AND po_no=?";       params.append(po)
     return scalar(f"SELECT SUM(order_qty) FROM sheet_orders WHERE article=? AND category=?{extra}", params)
 
+@st.cache_data(ttl=8, show_spinner=False)
 def get_received_qty(article, category, coff=None, po=None, exclude_id=None):
     params, extra = [article, category], ""
     if coff:       extra += " AND call_off_no=?"; params.append(coff)
@@ -315,6 +364,7 @@ def get_received_qty(article, category, coff=None, po=None, exclude_id=None):
     if exclude_id: extra += " AND id!=?";         params.append(exclude_id)
     return scalar(f"SELECT SUM(qty) FROM inventory WHERE article=? AND category=?{extra}", params)
 
+@st.cache_data(ttl=8, show_spinner=False)
 def get_bilty_qty(call_off_no, article, category=None):
     """Total quantity already dispatched (Bilty) from the Lahore factory for
     this Call-Off + Article (optionally scoped to one category)."""
@@ -322,6 +372,43 @@ def get_bilty_qty(call_off_no, article, category=None):
     if category:
         extra = " AND category=?"; params.append(category)
     return scalar(f"SELECT SUM(qty) FROM bilty WHERE call_off_no=? AND article=?{extra}", params)
+
+def _clear_dc_entry_caches():
+    """Called right after any DC Entry save so the freshly-saved figures
+    show up immediately instead of waiting out the short cache TTL."""
+    get_ordered_qty.clear()
+    get_received_qty.clear()
+    get_bilty_qty.clear()
+    _get_pending_articles.clear()
+
+@st.cache_data(ttl=8, show_spinner=False)
+def _get_pending_articles(call_off_no, sale_contract):
+    """PERFORMANCE FIX: this correlated nested-EXISTS query (which article
+    numbers under this Call-Off + Contract still have at least one pending
+    category) used to re-run uncached on every keystroke of the Call-Off
+    field — the single heaviest query in Step 2. Short-TTL cache only."""
+    return q("""
+        SELECT DISTINCT so.article
+        FROM sheet_orders AS so
+        WHERE so.call_off_no=? AND so.sale_contract=?
+          AND TRIM(so.article)!=''
+          AND EXISTS (
+              SELECT 1
+              FROM sheet_orders AS pending
+              WHERE pending.call_off_no=so.call_off_no
+                AND pending.sale_contract=so.sale_contract
+                AND pending.article=so.article
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM inventory AS inv
+                    WHERE inv.call_off_no=pending.call_off_no
+                      AND inv.contract_no=pending.sale_contract
+                      AND inv.article=pending.article
+                      AND inv.category=pending.category
+                )
+          )
+        ORDER BY so.article
+    """, [call_off_no, sale_contract])["article"].tolist()
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_cached_item_description(article, category):
@@ -373,6 +460,30 @@ def round_bal(val):
     except:
         return 0
 
+def build_article_blocks(df_ledger):
+    """BUGFIX: Master Ledger / PDF were showing only a flat GLOBAL sum per
+    category (e.g. total Inlay Cards across every article combined), which
+    hides which specific article still owes what. This groups by
+    [Article, Item Type] instead, and drops any category whose remaining
+    balance rounds to zero within that article — so each block only shows
+    what's actually still pending for that article.
+    Returns an ordered dict: {article: {item_type: remaining_balance, ...}}
+    """
+    blocks = {}
+    if df_ledger is None or df_ledger.empty:
+        return blocks
+    grouped = df_ledger.groupby(["Article", "Item Type"])["Remaining Balance"].sum().reset_index()
+    for article in sorted(grouped["Article"].unique().tolist()):
+        sub = grouped[grouped["Article"] == article]
+        cats = {}
+        for _, r in sub.iterrows():
+            bal = round_bal(r["Remaining Balance"])
+            if bal != 0:
+                cats[r["Item Type"]] = bal
+        if cats:
+            blocks[article] = cats
+    return blocks
+
 # ─────────────────────────────────────────────
 # PDF GENERATION
 # ─────────────────────────────────────────────
@@ -423,7 +534,49 @@ def generate_ledger_pdf(df_summary, df_articles, sel_coff, sel_cont, sel_art, re
     ]))
     story.append(t_sum)
     story.append(Spacer(1, 12))
-    
+
+    # NEW: SECTION 1B — Article-Wise Breakdown blocks. Fixes the bug where
+    # only flat global category totals were visible — each article now gets
+    # its own boxed block with its nested, non-zero category balances.
+    article_blocks = build_article_blocks(df_articles)
+    if article_blocks:
+        story.append(Paragraph("<b>🎯 SECTION 1B: ARTICLE-WISE BREAKDOWN</b>", h2_style))
+        block_cell_style = ParagraphStyle('BlockCell', parent=styles['Normal'], fontSize=8, leading=12)
+        block_head_style = ParagraphStyle('BlockHead', parent=styles['Normal'], fontSize=9, leading=13,
+                                           textColor=colors.white, fontName='Helvetica-Bold')
+        NCOLS = 3
+        block_cells = []
+        for article, cats in article_blocks.items():
+            lines = "<br/>".join(f"📦 {cat}: <b>{bal:,}</b> Pcs" for cat, bal in cats.items())
+            mini = Table(
+                [[Paragraph(f"🎯 Article: {article}", block_head_style)],
+                 [Paragraph(lines, block_cell_style)]],
+                colWidths=[158]
+            )
+            mini.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (0,0), colors.HexColor(title_color)),
+                ('BACKGROUND', (0,1), (0,1), colors.HexColor('#f8fafc')),
+                ('BOX', (0,0), (-1,-1), 0.75, colors.HexColor(title_color)),
+                ('INNERGRID', (0,0), (-1,-1), 0.5, colors.HexColor(title_color)),
+                ('TOPPADDING', (0,0), (-1,-1), 4),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+                ('LEFTPADDING', (0,0), (-1,-1), 6),
+            ]))
+            block_cells.append(mini)
+
+        rows = [block_cells[i:i+NCOLS] for i in range(0, len(block_cells), NCOLS)]
+        for row in rows:
+            while len(row) < NCOLS:
+                row.append("")
+        block_grid = Table(rows, colWidths=[166]*NCOLS)
+        block_grid.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('TOPPADDING', (0,0), (-1,-1), 4),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ]))
+        story.append(block_grid)
+        story.append(Spacer(1, 12))
+
     sec2_title = "<b>🔍 SECTION 2: PENDING ARTICLES BREAKDOWN (SHORTAGE LIST)</b>" if report_type in ("SHORTAGE", "CONTRACT_SHORTLIST") else "<b>🔍 SECTION 2: ARTICLES COMPLETE BREAKDOWN</b>"
     story.append(Paragraph(sec2_title, h2_style))
 
@@ -1015,6 +1168,12 @@ TAB_ACCESS = {
     "📤 Sheet Upload":     ["Admin"],
     "🚚 Bilty Management": ["Admin", "Data Entry", "CEO"],
     "👤 User Management":  ["Admin"],
+    # NEW ADDITION: Rider only ever has access to this one tab — every other
+    # tab above will render its 🔒 access-denied message for them via
+    # _access_ok(), which is the existing, established pattern in this app
+    # for restricting a role to a subset of tabs without breaking the
+    # Streamlit tab-bar layout (tabs can't be created conditionally).
+    "💸 Daily Expenses":   ["Admin", "CEO", "Rider"],
 }
 
 # Roles allowed to actually SAVE a new DC Entry (vs. just viewing the tab /
@@ -1031,9 +1190,10 @@ def _access_ok(tab_label):
 if "inline_edit_id" not in st.session_state:
     st.session_state["inline_edit_id"] = None
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "🔍 Global Search","➕ DC Entry","📋 All Entries",
-    "📊 Master Ledger","📤 Sheet Upload","🚚 Bilty Management","👤 User Management"
+    "📊 Master Ledger","📤 Sheet Upload","🚚 Bilty Management","👤 User Management",
+    "💸 Daily Expenses"
 ])
 
 # ═══════════════════════════════════════════════
@@ -1197,28 +1357,9 @@ with tab2:
                     # Keep an article selectable until every item category
                     # ordered for it has been saved.  A single saved Safety
                     # or Washing Paper row must not hide Tag/Inlay Card.
-                    art_list = q("""
-                        SELECT DISTINCT so.article
-                        FROM sheet_orders AS so
-                        WHERE so.call_off_no=? AND so.sale_contract=?
-                          AND TRIM(so.article)!=''
-                          AND EXISTS (
-                              SELECT 1
-                              FROM sheet_orders AS pending
-                              WHERE pending.call_off_no=so.call_off_no
-                                AND pending.sale_contract=so.sale_contract
-                                AND pending.article=so.article
-                                AND NOT EXISTS (
-                                    SELECT 1
-                                    FROM inventory AS inv
-                                    WHERE inv.call_off_no=pending.call_off_no
-                                      AND inv.contract_no=pending.sale_contract
-                                      AND inv.article=pending.article
-                                      AND inv.category=pending.category
-                                )
-                          )
-                        ORDER BY so.article
-                    """, [f_coff, f_contract])["article"].tolist()
+                    # PERFORMANCE FIX: now cached (see _get_pending_articles) —
+                    # this was the heaviest uncached query in the tab.
+                    art_list = _get_pending_articles(f_coff, f_contract)
                 else:
                     # Fallback when there are no contracts
                     f_contract = ""  # Safeguard downstream code from NameError
@@ -1466,6 +1607,7 @@ with tab2:
                     conn.close()
                     save_cached_item_description(dp_j_art, f_type, f_desc_jersey)
                     save_cached_item_description(dp_m_art, f_type, f_desc_molton)
+                    _clear_dc_entry_caches()
                     st.success(f"✅ Dual-Pack Entry saved — DC {s_dc} | " + " + ".join(saved_parts))
                     st.session_state["last_saved_dc"] = s_dc
                     st.rerun()
@@ -1493,6 +1635,7 @@ with tab2:
                 conn.commit()
                 conn.close()
                 save_cached_item_description(s_art, f_type, f_desc)
+                _clear_dc_entry_caches()
                 st.success(f"✅ Entry saved — DC {s_dc} | {f_qty:,.0f} pcs of {f_type}")
                 st.session_state["last_saved_dc"] = s_dc
                 st.rerun()
@@ -1767,6 +1910,36 @@ with tab4:
                 cls = color_classes.get(it_name, "kb")
                 with item_cols[idx % 3]:
                     st.markdown(f'<div class="kpi {cls}" style="margin-bottom: 6px;">⏳ Rem. {it_name}<br><b>{round_and_format(rem_val)}</b> Pcs</div>', unsafe_allow_html=True)
+
+            # ═══════════════════════════════════════════════
+            # 🆕 BUGFIX: ARTICLE-WISE BREAKDOWN — the block above only ever
+            # showed a flat GLOBAL total per category (e.g. total Inlay
+            # Cards across every article combined). This renders one boxed
+            # block PER ARTICLE with its own nested, non-zero category
+            # balances underneath — in a dynamic 1/2/3-column layout
+            # depending on how many articles are pending.
+            # ═══════════════════════════════════════════════
+            st.markdown("---")
+            st.markdown("##### 🎯 Article-Wise Remaining Breakdown (Detailed)")
+            article_blocks = build_article_blocks(df_ledger)
+            if not article_blocks:
+                st.caption("✅ No pending balance for any article in the current filter selection.")
+            else:
+                n_articles = len(article_blocks)
+                n_cols = 3 if n_articles >= 3 else (2 if n_articles == 2 else 1)
+                art_block_cols = st.columns(n_cols)
+                for idx, (article, cats) in enumerate(article_blocks.items()):
+                    cat_lines = "".join(
+                        f'<div style="font-size:12px; margin-top:2px;">📦 {cat}: <b>{bal:,}</b> Pcs</div>'
+                        for cat, bal in cats.items()
+                    )
+                    with art_block_cols[idx % n_cols]:
+                        st.markdown(f'''
+                        <div class="kpi kb" style="text-align:left; margin-bottom:8px; padding:10px; border-radius:6px;">
+                            <span style="font-size:13px; font-weight:700;">🎯 Article: {article}</span>
+                            {cat_lines}
+                        </div>
+                        ''', unsafe_allow_html=True)
 
             # ═══════════════════════════════════════════════
             # 🆕 NEW ADDITION: CONTRACT-WISE SHORTFALL SUMMARY
@@ -2386,7 +2559,7 @@ with tab7:
                 nu_fullname = st.text_input("Full Name *")
             with nu_c2:
                 nu_password = st.text_input("Password *", type="password")
-                nu_role = st.selectbox("Role *", ["Admin", "Data Entry", "Viewer", "CEO"])
+                nu_role = st.selectbox("Role *", ["Admin", "Data Entry", "Viewer", "CEO", "Rider"])
             nu_submit = st.form_submit_button("➕ Create User", type="primary")
 
         if nu_submit:
@@ -2449,6 +2622,163 @@ with tab7:
                         st.rerun()
         else:
             st.caption("No other users to delete.")
+
+# ═══════════════════════════════════════════════
+# TAB 8 — 🆕 DAILY EXPENSES / STAFF EXPENSE
+# ═══════════════════════════════════════════════
+with tab8:
+    if _access_ok("💸 Daily Expenses"):
+        st.markdown('<div class="sec">💸 Daily Expenses — Staff / Rider Expense Ledger</div>', unsafe_allow_html=True)
+
+        is_rider = (current_role == "Rider")
+
+        # ───────────── ENTRY FORM ─────────────
+        st.markdown("##### ➕ New Expense Entry")
+        with st.form("expense_entry_form", clear_on_submit=True):
+            exp_c1, exp_c2 = st.columns(2)
+            with exp_c1:
+                exp_date = st.date_input("Date", value=date.today(), key="exp_date")
+                if is_rider:
+                    target_user = current_user["username"]
+                    st.text_input("Rider / Staff", value=target_user, disabled=True, key="exp_target_ro")
+                else:
+                    _riders_df = q("SELECT username FROM app_users WHERE role='Rider' ORDER BY username")
+                    rider_opts = _riders_df["username"].tolist() if not _riders_df.empty else []
+                    if current_user["username"] not in rider_opts:
+                        rider_opts = [current_user["username"]] + rider_opts
+                    target_user = st.selectbox("Rider / Staff *", rider_opts, key="exp_target_user")
+                exp_category = st.selectbox("Category *", EXPENSE_CATEGORIES, key="exp_category")
+            with exp_c2:
+                exp_amount = st.number_input("Amount (PKR) *", min_value=0.0, step=50.0, key="exp_amount")
+                exp_ref = st.text_input("Reference / Bill No. (Optional)", key="exp_ref")
+                exp_remarks = st.text_area("Remarks", key="exp_remarks", height=80)
+
+            st.markdown("**📸 Bill / Receipt Photo**")
+            exp_photo_mode = st.radio(
+                "Photo source", ["📷 Take Photo", "🖼️ Upload from Gallery", "— Skip —"],
+                horizontal=True, key="exp_photo_mode")
+            bill_img_file = None
+            if exp_photo_mode == "📷 Take Photo":
+                bill_img_file = st.camera_input("📷 بل یا پرچی کی تصویر کھینچیں (Take Bill Photo)", key="exp_camera")
+            elif exp_photo_mode == "🖼️ Upload from Gallery":
+                bill_img_file = st.file_uploader("🖼️ Upload Bill/Receipt Image", type=["png", "jpg", "jpeg"], key="exp_upload")
+
+            # Convert image file to bytes for database storage
+            img_bytes = bill_img_file.getvalue() if bill_img_file is not None else None
+
+            exp_submit = st.form_submit_button("💾 Save Expense", type="primary")
+
+        if exp_submit:
+            if is_rider is False and not target_user:
+                st.error("⚠️ No Rider/Staff selected. Create a Rider account first from 👤 User Management.")
+            elif exp_amount <= 0:
+                st.error("⚠️ Amount must be greater than 0.")
+            else:
+                conn = get_conn()
+                conn.execute("""
+                    INSERT INTO rider_expenses (date, user_id, entered_by, category, amount, reference_no, remarks, bill_image)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (str(exp_date), target_user, current_user["username"], exp_category, float(exp_amount),
+                      str(exp_ref).strip(), str(exp_remarks).strip(), img_bytes))
+                conn.commit()
+                conn.close()
+                st.success(f"✅ Expense of PKR {exp_amount:,.0f} saved for {target_user}.")
+                st.rerun()
+
+        st.markdown("---")
+
+        # ───────────── LEDGER ─────────────
+        if is_rider:
+            st.markdown("##### 📋 My Expense History")
+            df_exp = q("""SELECT id, date, category, amount, reference_no, remarks, bill_image
+                          FROM rider_expenses WHERE user_id=? ORDER BY date DESC, id DESC""",
+                       [current_user["username"]])
+            filt_rider = "All"
+        else:
+            st.markdown("##### 📋 Expense Ledger — CEO / Admin View")
+            all_riders = q("SELECT DISTINCT user_id FROM rider_expenses ORDER BY user_id")["user_id"].tolist()
+            filt_rider = st.selectbox("Filter by Rider/Staff", ["All"] + all_riders, key="exp_filter_rider")
+            if filt_rider == "All":
+                df_exp = q("""SELECT id, date, user_id, category, amount, reference_no, remarks, bill_image
+                              FROM rider_expenses ORDER BY date DESC, id DESC""")
+            else:
+                df_exp = q("""SELECT id, date, user_id, category, amount, reference_no, remarks, bill_image
+                              FROM rider_expenses WHERE user_id=? ORDER BY date DESC, id DESC""", [filt_rider])
+
+        if df_exp.empty:
+            st.info("No expense entries yet.")
+        else:
+            total_spent = float(df_exp["amount"].sum())
+            adv_mask = df_exp["category"].astype(str).str.contains("Advance Salary", na=False)
+            total_advance = float(df_exp.loc[adv_mask, "amount"].sum())
+            total_other = total_spent - total_advance
+            kc1, kc2, kc3 = st.columns(3)
+            kc1.markdown(f"<div class='kpi kb'>💰 Total Spent<br><b>PKR {total_spent:,.0f}</b></div>", unsafe_allow_html=True)
+            kc2.markdown(f"<div class='kpi ka'>🧾 Operational Spend<br><b>PKR {total_other:,.0f}</b></div>", unsafe_allow_html=True)
+            kc3.markdown(f"<div class='kpi kp'>💵 Salary Advances<br><b>PKR {total_advance:,.0f}</b></div>", unsafe_allow_html=True)
+            st.markdown("---")
+
+            for _, row in df_exp.iterrows():
+                header_bits = [str(row["date"]), row["category"], f"PKR {row['amount']:,.0f}"]
+                if not is_rider:
+                    header_bits.insert(1, f"👤 {row['user_id']}")
+                ref_txt = f" | Ref: {row['reference_no']}" if str(row.get("reference_no") or "").strip() else ""
+                row_c1, row_c2 = st.columns([5, 1])
+                with row_c1:
+                    st.markdown(f"**{' | '.join(header_bits)}**{ref_txt}")
+                    if str(row.get("remarks") or "").strip():
+                        st.caption(row["remarks"])
+                with row_c2:
+                    has_img = row.get("bill_image") is not None
+                    if has_img:
+                        with st.popover("👁️ View Receipt"):
+                            try:
+                                st.image(bytes(row["bill_image"]), width=300)
+                            except Exception:
+                                st.caption("⚠️ Could not load this receipt image.")
+                    else:
+                        st.caption("— no receipt —")
+                if not is_rider:
+                    del_c1, del_c2 = st.columns([3, 1])
+                    with del_c1:
+                        confirm_del = st.checkbox(f"Confirm delete entry #{row['id']}", key=f"exp_del_chk_{row['id']}")
+                    with del_c2:
+                        if confirm_del and st.button("🗑️ Delete", key=f"exp_del_btn_{row['id']}"):
+                            conn = get_conn()
+                            conn.execute("DELETE FROM rider_expenses WHERE id=?", (int(row["id"]),))
+                            conn.commit()
+                            conn.close()
+                            st.success("✅ Entry deleted.")
+                            st.rerun()
+                st.markdown("---")
+
+            if not is_rider:
+                def _generate_expense_excel(df):
+                    import openpyxl
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Staff Expenses"
+                    export_cols = [c for c in df.columns if c != "bill_image"]
+                    bold = openpyxl.styles.Font(bold=True)
+                    for ci, col in enumerate(export_cols):
+                        ws.cell(row=1, column=1 + ci, value=col).font = bold
+                    for ri, (_, r) in enumerate(df.iterrows(), start=2):
+                        for ci, col in enumerate(export_cols):
+                            ws.cell(row=ri, column=1 + ci, value=r[col])
+                    for col_letter in "ABCDEFGH":
+                        ws.column_dimensions[col_letter].width = 18
+                    buf = io.BytesIO()
+                    wb.save(buf)
+                    buf.seek(0)
+                    return buf
+
+                st.download_button(
+                    label="⬇️ Export Ledger to Excel",
+                    data=_generate_expense_excel(df_exp),
+                    file_name=f"Staff_Expenses_{filt_rider if filt_rider != 'All' else 'AllRiders'}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="exp_export_excel"
+                )
 
 st.markdown("""
 <div class="footer">
