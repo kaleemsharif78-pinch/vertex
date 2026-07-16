@@ -775,7 +775,7 @@ def _generate_ditto_dc_excel(dc_no, call_off_no, contract_no, token_no, destinat
     buf.seek(0)
     return buf
 
-def _generate_ditto_dc_pdf(dc_no, call_off_no, contract_no, token_no, destination, entry_date, items, prepared_by):
+def _generate_ditto_dc_pdf(dc_no, call_off_no, contract_no, token_no, destination, entry_date, items, prepared_by, matrix_items=None):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=25, bottomMargin=25)
     story = []
@@ -837,7 +837,15 @@ def _generate_ditto_dc_pdf(dc_no, call_off_no, contract_no, token_no, destinatio
                                 ParagraphStyle('CatTot', parent=styles['Normal'], fontSize=9, alignment=2)))
     story.append(Spacer(1, 14))
 
-    cats_present, arts_present, matrix = _dc_article_matrix(items)
+    # BUGFIX: the main item table above is intentionally CONSOLIDATED across
+    # articles (one row per distinct accessory, article dropped from the
+    # key — see the grouping comment in render_ditto_dc_section), so `items`
+    # itself no longer carries a usable "article" value here. That's why
+    # this Article-Wise Summary used to print a blank Article # column
+    # whenever a DC spanned more than one article. Feeding it `matrix_items`
+    # instead — the UN-consolidated per-article rows — restores the real
+    # Article Numbers next to their Tag Card / Inlay Card breakdown.
+    cats_present, arts_present, matrix = _dc_article_matrix(matrix_items if matrix_items is not None else items)
     if arts_present:
         # NEW ADDITION: when the article list is long, spread it across 2 or
         # 3 side-by-side column-blocks instead of one long vertical list, so
