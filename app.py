@@ -866,6 +866,12 @@ def get_received_qty(article, category, coff=None, po=None, exclude_id=None):
     return scalar(f"SELECT SUM(qty) FROM inventory WHERE article=? AND category=?{extra}", params)
 
 @st.cache_data(ttl=8, show_spinner=False)
+def get_total_ordered_for_article(call_off_no, article):
+    """Sum of order_qty across ALL categories for one Call-Off + Article —
+    used by the live Bilty dispatch % indicator in Step 2."""
+    return scalar("SELECT SUM(order_qty) FROM sheet_orders WHERE call_off_no=? AND article=?", [call_off_no, article])
+
+@st.cache_data(ttl=8, show_spinner=False)
 def get_bilty_qty(call_off_no, article, category=None):
     """Total quantity already dispatched (Bilty) from the Lahore factory for
     this Call-Off + Article (optionally scoped to one category)."""
@@ -881,6 +887,59 @@ def _clear_dc_entry_caches():
     get_received_qty.clear()
     get_bilty_qty.clear()
     _get_pending_articles.clear()
+    get_calloff_brand_po.clear()
+    get_bilty_breakdown.clear()
+    get_dual_pack_articles.clear()
+    get_category_totals_for_contract.clear()
+    get_ordered_for_article_contract.clear()
+    get_received_for_article_contract.clear()
+    get_total_ordered_for_article.clear()
+
+# PERFORMANCE FIX (SHOW-STOPPER — 5-8 min DC Entry lag, follow-up round):
+# these six queries were STILL firing uncached on every rerun (i.e. every
+# keystroke/selection anywhere in the DC Entry form) even after the first
+# round of caching — together roughly 8-10 more fresh network round-trips
+# per rerun on top of the ones already fixed. Same short-TTL pattern as
+# above; all cleared together in _clear_dc_entry_caches() on save.
+@st.cache_data(ttl=8, show_spinner=False)
+def get_calloff_brand_po(call_off_no, sale_contract=None):
+    """Returns (brand, [po_no, ...]) for the Step 1 auto-load info box."""
+    if sale_contract:
+        df_brand = q("SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1", [call_off_no, sale_contract])
+        df_po = q("SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(po_no)!='' ORDER BY po_no", [call_off_no, sale_contract])
+    else:
+        df_brand = q("SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND TRIM(brand)!='' LIMIT 1", [call_off_no])
+        df_po = q("SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND TRIM(po_no)!='' ORDER BY po_no", [call_off_no])
+    brand = df_brand.iloc[0]["brand"] if not df_brand.empty else ""
+    return brand, df_po["po_no"].tolist()
+
+@st.cache_data(ttl=8, show_spinner=False)
+def get_bilty_breakdown(call_off_no, article):
+    """Category-wise Bilty breakdown shown under the live dispatch indicator."""
+    return q("SELECT category, SUM(qty) AS tot FROM bilty WHERE call_off_no=? AND article=? GROUP BY category ORDER BY category", [call_off_no, article])
+
+@st.cache_data(ttl=8, show_spinner=False)
+def get_dual_pack_articles(call_off_no, sale_contract, category):
+    """Returns (jersey_articles, molton_articles) for the dual-pack UI toggle."""
+    dpj = q("SELECT DISTINCT article FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND category=? AND variant='Jersey'", [call_off_no, sale_contract, category])
+    dpm = q("SELECT DISTINCT article FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND category=? AND variant='Molton'", [call_off_no, sale_contract, category])
+    return dpj["article"].tolist(), dpm["article"].tolist()
+
+@st.cache_data(ttl=8, show_spinner=False)
+def get_category_totals_for_contract(call_off_no, sale_contract):
+    """Ordered-vs-received totals per category for the Live Contract Status
+    Counter — one grouped query each instead of 2-per-category."""
+    df_ord = q("SELECT category, SUM(order_qty) AS tot FROM sheet_orders WHERE call_off_no=? AND sale_contract=? GROUP BY category", [call_off_no, sale_contract])
+    df_rec = q("SELECT category, SUM(qty) AS tot FROM inventory WHERE call_off_no=? AND contract_no=? GROUP BY category", [call_off_no, sale_contract])
+    return dict(zip(df_ord["category"], df_ord["tot"])), dict(zip(df_rec["category"], df_rec["tot"]))
+
+@st.cache_data(ttl=8, show_spinner=False)
+def get_ordered_for_article_contract(call_off_no, sale_contract, category, article):
+    return scalar("SELECT SUM(order_qty) FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND category=? AND article=?", [call_off_no, sale_contract, category, article])
+
+@st.cache_data(ttl=8, show_spinner=False)
+def get_received_for_article_contract(call_off_no, sale_contract, category, article):
+    return scalar("SELECT SUM(qty) FROM inventory WHERE call_off_no=? AND contract_no=? AND category=? AND article=?", [call_off_no, sale_contract, category, article])
 
 @st.cache_data(ttl=8, show_spinner=False)
 def _get_pending_articles(call_off_no, sale_contract):
@@ -1896,18 +1955,9 @@ with tab2:
                         else:
                             f_contract = st.selectbox("Select Contract # *", contracts_for_coff, key="dc_cont_sel")
                 
-                    # Safe query using q() helper instead of raw conn_tmp execution
-                    df_brand = q(
-                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(brand)!='' LIMIT 1",
-                        [f_coff, f_contract]
-                    )
-                    brand = df_brand.iloc[0]["brand"] if not df_brand.empty else ""
-
-                    df_po = q(
-                        "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND TRIM(po_no)!='' ORDER BY po_no",
-                        [f_coff, f_contract]
-                    )
-                    po_for_sc = df_po["po_no"].tolist()
+                    # PERFORMANCE FIX: cached (see get_calloff_brand_po) — was
+                    # 2 fresh round-trips on every rerun.
+                    brand, po_for_sc = get_calloff_brand_po(f_coff, f_contract)
 
                     # Keep an article selectable until every item category
                     # ordered for it has been saved.  A single saved Safety
@@ -1918,18 +1968,7 @@ with tab2:
                 else:
                     # Fallback when there are no contracts
                     f_contract = ""  # Safeguard downstream code from NameError
-                    
-                    df_brand = q(
-                        "SELECT DISTINCT brand FROM sheet_orders WHERE call_off_no=? AND TRIM(brand)!='' LIMIT 1",
-                        [f_coff]
-                    )
-                    brand = df_brand.iloc[0]["brand"] if not df_brand.empty else ""
-                
-                    df_po = q(
-                        "SELECT DISTINCT po_no FROM sheet_orders WHERE call_off_no=? AND TRIM(po_no)!='' ORDER BY po_no",
-                        [f_coff]
-                    )
-                    po_for_sc = df_po["po_no"].tolist()
+                    brand, po_for_sc = get_calloff_brand_po(f_coff)
 
             with info_col:
                 if f_coff and (contracts_for_coff or po_for_sc):
@@ -1965,9 +2004,7 @@ with tab2:
                 # touch the existing Ordered/Received calculations below.
                 if f_coff and f_art:
                     bilty_done_art = get_bilty_qty(f_coff, f_art)
-                    ordered_for_art = scalar(
-                        "SELECT SUM(order_qty) FROM sheet_orders WHERE call_off_no=? AND article=?",
-                        [f_coff, f_art])
+                    ordered_for_art = get_total_ordered_for_article(f_coff, f_art)
                     rb = int(math.floor(bilty_done_art + 0.5))
                     ro = int(math.floor(ordered_for_art + 0.5))
                     pct_txt = f" ({(rb/ro*100):.0f}%)" if ro > 0 else ""
@@ -1975,9 +2012,7 @@ with tab2:
                     # NEW ADDITION: item-wise breakdown for this article, sourced
                     # ONLY from the bilty table (historical dispatch records) —
                     # rendered inside this exact same blue box.
-                    df_bilty_breakdown = q(
-                        "SELECT category, SUM(qty) AS tot FROM bilty WHERE call_off_no=? AND article=? GROUP BY category ORDER BY category",
-                        [f_coff, f_art])
+                    df_bilty_breakdown = get_bilty_breakdown(f_coff, f_art)
                     breakdown_html = ""
                     if not df_bilty_breakdown.empty:
                         rows_html = "".join(
@@ -2021,12 +2056,7 @@ with tab2:
                 is_dual_pack = False
                 dp_jersey_articles, dp_molton_articles = [], []
                 if f_coff and f_contract:
-                    dpj = q("SELECT DISTINCT article FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND category=? AND variant='Jersey'",
-                            [f_coff, f_contract, f_type])
-                    dpm = q("SELECT DISTINCT article FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND category=? AND variant='Molton'",
-                            [f_coff, f_contract, f_type])
-                    dp_jersey_articles = dpj["article"].tolist()
-                    dp_molton_articles = dpm["article"].tolist()
+                    dp_jersey_articles, dp_molton_articles = get_dual_pack_articles(f_coff, f_contract, f_type)
                     is_dual_pack = bool(dp_jersey_articles) and bool(dp_molton_articles)
 
                 if is_dual_pack:
@@ -2067,15 +2097,9 @@ with tab2:
             counter_cols = st.columns(2)
         
             if f_coff and f_contract:
-                # PERFORMANCE FIX: this used to run 2 separate queries PER
-                # category (14 round-trips total for 7 ITEM_TYPES) on every
-                # single rerun — the main cause of DC Entry feeling slow on a
-                # remote DB. Replaced with 2 grouped queries total, then
-                # looked up in-memory per category below.
-                df_ord_cat = q("SELECT category, SUM(order_qty) AS tot FROM sheet_orders WHERE call_off_no=? AND sale_contract=? GROUP BY category", [f_coff, f_contract])
-                df_rec_cat = q("SELECT category, SUM(qty) AS tot FROM inventory WHERE call_off_no=? AND contract_no=? GROUP BY category", [f_coff, f_contract])
-                ord_map = dict(zip(df_ord_cat["category"], df_ord_cat["tot"]))
-                rec_map = dict(zip(df_rec_cat["category"], df_rec_cat["tot"]))
+                # PERFORMANCE FIX: cached (see get_category_totals_for_contract) —
+                # was 2 fresh grouped round-trips on every single rerun.
+                ord_map, rec_map = get_category_totals_for_contract(f_coff, f_contract)
 
                 for idx, item in enumerate(ITEM_TYPES):
                     o_q = ord_map.get(item, 0) or 0
@@ -2086,7 +2110,9 @@ with tab2:
                     r_q_rem = rounded_oq - rounded_rq
                 
                     if item == f_type:
-                        max_allowed = scalar("SELECT SUM(order_qty) FROM sheet_orders WHERE call_off_no=? AND sale_contract=? AND category=? AND article=?", [f_coff, f_contract, item, f_art]) - scalar("SELECT SUM(qty) FROM inventory WHERE call_off_no=? AND contract_no=? AND category=? AND article=?", [f_coff, f_contract, item, f_art])
+                        # PERFORMANCE FIX: cached helpers instead of 2 fresh
+                        # round-trips on every rerun.
+                        max_allowed = get_ordered_for_article_contract(f_coff, f_contract, item, f_art) - get_received_for_article_contract(f_coff, f_contract, item, f_art)
                 
                     b_cls = "kb" if r_q_rem > 0 else "kr"
                 
