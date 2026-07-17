@@ -9,6 +9,7 @@ import secrets as pysecrets
 import base64
 import json
 from datetime import date
+import time as _time
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -39,12 +40,34 @@ def _get_engine():
     elif db_url.startswith("postgresql://") and "+pg8000" not in db_url:
         db_url = db_url.replace("postgresql://", "postgresql+pg8000://", 1)
 
+    # CRITICAL FIX (production-critical 20-minute stalls): NOTHING in the
+    # previous config bounded how long a single connection attempt or query
+    # could hang. pg8000's socket has no default timeout, and Postgres has
+    # no default statement_timeout — so if the network path to the DB is
+    # degraded (not fully down, just slow/lossy), a connect or a query can
+    # sit there for minutes with zero ceiling. Worse, the retry-on-error
+    # logic added for the earlier "network error" crash then retries that
+    # same unbounded wait a second time. A single DC Entry fires ~15-20 DB
+    # calls (Step 1 auto-load, Step 2 live indicators, the save itself) —
+    # at 1-2 minutes of unbounded hang each, that alone accounts for a
+    # 20-minute save. These caps make every attempt fail FAST (single-digit
+    # seconds) instead of hanging, which is a strict improvement either way:
+    # if the network is fine, these never trigger; if it's degraded, you
+    # get a fast, clear error instead of a frozen page.
+    connect_args = {}
+    if db_url.startswith("postgresql+pg8000"):
+        connect_args = {
+            "timeout": 8,  # socket connect timeout, seconds
+            "options": "-c statement_timeout=15000",  # server-side query cap, ms
+        }
+
     return create_engine(
         db_url,
         pool_pre_ping=True,
         pool_size=5,
         max_overflow=10,
         pool_recycle=300,
+        connect_args=connect_args,
     )
 
 # RELIABILITY FIX: crash seen in production —
@@ -77,6 +100,30 @@ def _qmark_to_named(sql, params):
             out.append(ch)
     return "".join(out), pdict
 
+# PRODUCTION-CRITICAL AUDIT TOOLING: records every DB call slower than
+# SLOW_QUERY_THRESHOLD_S. Printed to stdout (visible in Streamlit Cloud's
+# "Manage app" → logs, same place the original network-error traceback was
+# recorded) AND kept in an in-memory ring buffer surfaced to Admin/CEO in
+# the app itself under 👤 User Management → 🩺 Performance Diagnostics —
+# so the exact slow function/query is visible without needing log access.
+SLOW_QUERY_THRESHOLD_S = 2.0
+_SLOW_QUERY_LOG = []  # process-global ring buffer, capped below
+
+def _log_slow_query(sql, elapsed, error=None, retry=False):
+    if elapsed < SLOW_QUERY_THRESHOLD_S and not error:
+        return
+    entry = {
+        "ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "elapsed_s": round(elapsed, 2),
+        "sql": " ".join(sql.split())[:200],
+        "error": error,
+        "retry": retry,
+    }
+    tag = "ERROR" if error else ("RETRY" if retry else "SLOW")
+    print(f"[{tag} QUERY] {entry['elapsed_s']}s :: {entry['sql']}" + (f" :: {error}" if error else ""))
+    _SLOW_QUERY_LOG.append(entry)
+    del _SLOW_QUERY_LOG[:-100]  # keep only the most recent 100
+
 class _CompatConn:
     """Thin wrapper so `conn = get_conn(); conn.execute(sql, [params]); 
     conn.commit(); conn.close()` (written for sqlite3) keeps working unchanged
@@ -85,9 +132,13 @@ class _CompatConn:
         self._conn = sa_conn
     def execute(self, sql, params=None):
         named_sql, pdict = _qmark_to_named(sql, params or [])
+        t0 = _time.monotonic()
         try:
-            return self._conn.execute(text(named_sql), pdict)
+            result = self._conn.execute(text(named_sql), pdict)
+            _log_slow_query(sql, _time.monotonic() - t0)
+            return result
         except (OperationalError, SAInterfaceError, DBAPIError) as e:
+            _log_slow_query(sql, _time.monotonic() - t0, error=str(e))
             if not _is_transient_db_error(e):
                 raise
             # Connection died mid-session (see _is_transient_db_error note
@@ -100,7 +151,10 @@ class _CompatConn:
                 pass
             _get_engine().dispose()
             self._conn = _get_engine().connect()
-            return self._conn.execute(text(named_sql), pdict)
+            t1 = _time.monotonic()
+            result = self._conn.execute(text(named_sql), pdict)
+            _log_slow_query(sql, _time.monotonic() - t1, retry=True)
+            return result
     def commit(self):
         self._conn.commit()
     def close(self):
@@ -790,9 +844,16 @@ def q(sql, params=None):
     named_sql, pdict = _qmark_to_named(sql, params or [])
 
     def _run():
-        engine = _get_engine()
-        with engine.connect() as conn:
-            return pd.read_sql(text(named_sql), conn, params=pdict)
+        t0 = _time.monotonic()
+        try:
+            engine = _get_engine()
+            with engine.connect() as conn:
+                df = pd.read_sql(text(named_sql), conn, params=pdict)
+            _log_slow_query(sql, _time.monotonic() - t0)
+            return df
+        except Exception as e:
+            _log_slow_query(sql, _time.monotonic() - t0, error=str(e))
+            raise
 
     try:
         return _run()
@@ -3183,6 +3244,28 @@ with tab6:
 with tab7:
     if _access_ok("👤 User Management"):
         st.markdown('<div class="sec">👤 User Management — Admin Only</div>', unsafe_allow_html=True)
+
+        # NEW ADDITION: Performance Diagnostics — every DB call slower than
+        # SLOW_QUERY_THRESHOLD_S (2s) gets logged here with its elapsed time
+        # and exact SQL, live, as the app is used. This is the tool for
+        # pinpointing exactly which function/query is causing a slow save —
+        # reproduce the slow action once, then check this panel immediately
+        # after; the same entries are also printed to the Streamlit Cloud
+        # app logs (Manage app → logs) if you'd rather grep there.
+        with st.expander("🩺 Performance Diagnostics — Slow Query Log", expanded=False):
+            if not _SLOW_QUERY_LOG:
+                st.caption("No slow queries recorded yet this session (threshold: "
+                           f"{SLOW_QUERY_THRESHOLD_S:.0f}s). Reproduce the slow action, "
+                           "then reopen this panel.")
+            else:
+                df_slow = pd.DataFrame(list(reversed(_SLOW_QUERY_LOG)))
+                st.dataframe(df_slow, width='stretch', hide_index=True)
+                st.caption(f"Showing the {len(df_slow)} most recent slow/failed queries this app session "
+                           "(most recent first). ERROR rows show a connection-level failure; RETRY rows "
+                           "show how long the automatic retry took after that failure.")
+            if st.button("🗑️ Clear Log", key="clear_slow_log"):
+                _SLOW_QUERY_LOG.clear()
+                st.rerun()
 
         st.markdown("##### ➕ Create New User")
         with st.form("create_user_form", clear_on_submit=True):
