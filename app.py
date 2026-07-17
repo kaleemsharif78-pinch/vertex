@@ -896,11 +896,13 @@ def _generate_ditto_dc_pdf(dc_no, call_off_no, contract_no, token_no, destinatio
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _build_ditto_dc_exports(dc_no, call_off_no, contract_no, token_no, destination,
-                            entry_date, items_json, filename_base, prepared_by):
+                            entry_date, items_json, filename_base, prepared_by, matrix_items_json=None):
     """Build each unchanged DC once; Streamlit reruns then reuse the bytes."""
     items = json.loads(items_json)
+    matrix_items = json.loads(matrix_items_json) if matrix_items_json is not None else None
     pdf = _generate_ditto_dc_pdf(
-        dc_no, call_off_no, contract_no, token_no, destination, entry_date, items, prepared_by)
+        dc_no, call_off_no, contract_no, token_no, destination, entry_date, items, prepared_by,
+        matrix_items=matrix_items)
     xlsx = _generate_ditto_dc_excel(
         dc_no, call_off_no, contract_no, token_no, destination, entry_date, items,
         filename_base, prepared_by)
@@ -986,15 +988,26 @@ def render_ditto_dc_section(key_prefix, default_dc=None):
         })
 
 
+    # NEW: matrix_items keeps the RAW per-article rows (article number intact)
+    # purely for the PDF's Article-Wise Summary — separate from `line_items`
+    # above, which is deliberately consolidated across articles for the main
+    # table. See the article-number bugfix note inside _generate_ditto_dc_pdf.
+    matrix_items = [
+        {"article": r["article"], "category": r["category"], "qty": float(r["qty"] or 0)}
+        for r in raw_rows
+    ]
+
     ditto_filename_base = f"DC-{ditto_dc_sel}_GulAhmed_{_fmt_date_ddmmyyyy(hdr['entry_date'])}_Cont-{hdr['contract_no']}"
     st.markdown(f"**📄 File Name:** `{ditto_filename_base}`")
 
     prepared_by = current_user["full_name"] if current_user else "—"
 
     items_json = json.dumps(line_items, sort_keys=True, default=str)
+    matrix_items_json = json.dumps(matrix_items, sort_keys=True, default=str)
     pdf_bytes, xlsx_bytes = _build_ditto_dc_exports(
         ditto_dc_sel, hdr["call_off_no"], hdr["contract_no"], dc_token, dc_dest,
-        str(hdr["entry_date"]), items_json, ditto_filename_base, prepared_by)
+        str(hdr["entry_date"]), items_json, ditto_filename_base, prepared_by,
+        matrix_items_json=matrix_items_json)
     ditto_pdf_buf = io.BytesIO(pdf_bytes)
     ditto_xlsx_buf = io.BytesIO(xlsx_bytes)
 
@@ -1181,7 +1194,7 @@ TAB_ACCESS = {
     # _access_ok(), which is the existing, established pattern in this app
     # for restricting a role to a subset of tabs without breaking the
     # Streamlit tab-bar layout (tabs can't be created conditionally).
-    "💸 Daily Expenses":   ["Admin", "CEO", "Rider"],
+    "💸 Daily Expenses":   ["Admin", "CEO", "Rider", "Data Entry"],
 }
 
 # Roles allowed to actually SAVE a new DC Entry (vs. just viewing the tab /
@@ -2638,7 +2651,10 @@ with tab8:
     if _access_ok("💸 Daily Expenses"):
         st.markdown('<div class="sec">💸 Daily Expenses — Staff / Rider Expense Ledger</div>', unsafe_allow_html=True)
 
-        is_rider = (current_role == "Rider")
+        # SECURITY UPDATE: Rider AND Data Entry are both "restricted" users —
+        # they may add their own expenses, but must not see, filter, edit or
+        # delete anyone else's. Only Admin/CEO get the full ledger view.
+        is_restricted = current_role in ("Rider", "Data Entry")
 
         # ───────────── ENTRY FORM ─────────────
         st.markdown("##### ➕ New Expense Entry")
@@ -2646,9 +2662,9 @@ with tab8:
             exp_c1, exp_c2 = st.columns(2)
             with exp_c1:
                 exp_date = st.date_input("Date", value=date.today(), key="exp_date")
-                if is_rider:
+                if is_restricted:
                     target_user = current_user["username"]
-                    st.text_input("Rider / Staff", value=target_user, disabled=True, key="exp_target_ro")
+                    st.text_input("Entering Expense For (You)", value=target_user, disabled=True, key="exp_target_ro")
                 else:
                     _riders_df = q("SELECT username FROM app_users WHERE role='Rider' ORDER BY username")
                     rider_opts = _riders_df["username"].tolist() if not _riders_df.empty else []
@@ -2677,7 +2693,7 @@ with tab8:
             exp_submit = st.form_submit_button("💾 Save Expense", type="primary")
 
         if exp_submit:
-            if is_rider is False and not target_user:
+            if is_restricted is False and not target_user:
                 st.error("⚠️ No Rider/Staff selected. Create a Rider account first from 👤 User Management.")
             elif exp_amount <= 0:
                 st.error("⚠️ Amount must be greater than 0.")
@@ -2696,7 +2712,7 @@ with tab8:
         st.markdown("---")
 
         # ───────────── LEDGER ─────────────
-        if is_rider:
+        if is_restricted:
             st.markdown("##### 📋 My Expense History")
             df_exp = q("""SELECT id, date, category, amount, reference_no, remarks, bill_image
                           FROM rider_expenses WHERE user_id=? ORDER BY date DESC, id DESC""",
@@ -2728,7 +2744,7 @@ with tab8:
 
             for _, row in df_exp.iterrows():
                 header_bits = [str(row["date"]), row["category"], f"PKR {row['amount']:,.0f}"]
-                if not is_rider:
+                if not is_restricted:
                     header_bits.insert(1, f"👤 {row['user_id']}")
                 ref_txt = f" | Ref: {row['reference_no']}" if str(row.get("reference_no") or "").strip() else ""
                 row_c1, row_c2 = st.columns([5, 1])
@@ -2746,7 +2762,7 @@ with tab8:
                                 st.caption("⚠️ Could not load this receipt image.")
                     else:
                         st.caption("— no receipt —")
-                if not is_rider:
+                if not is_restricted:
                     del_c1, del_c2 = st.columns([3, 1])
                     with del_c1:
                         confirm_del = st.checkbox(f"Confirm delete entry #{row['id']}", key=f"exp_del_chk_{row['id']}")
@@ -2760,7 +2776,7 @@ with tab8:
                             st.rerun()
                 st.markdown("---")
 
-            if not is_rider:
+            if not is_restricted:
                 def _generate_expense_excel(df):
                     import openpyxl
                     wb = openpyxl.Workbook()
