@@ -14,6 +14,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from sqlalchemy import create_engine, text, inspect
+from sqlalchemy.exc import OperationalError, InterfaceError as SAInterfaceError, DBAPIError
 
 # ═══════════════════════════════════════════════
 # DATABASE SYSTEM — CLOUD (pg8000 driver — pure-Python, avoids psycopg2
@@ -46,6 +47,22 @@ def _get_engine():
         pool_recycle=300,
     )
 
+# RELIABILITY FIX: crash seen in production —
+#   pg8000.core.InterfaceError: network error
+# fired from inside scalar()/q(), which crashed the whole page. This is a
+# connection dropped mid-session by the DB provider (idle-connection kill,
+# brief network blip) — NOT a SQL error, and NOT something pool_pre_ping
+# catches, since pre_ping only checks a connection when it's checked OUT of
+# the pool, not while a query is actively running on it. The fix below
+# detects this class of error and retries exactly once on a fresh
+# connection, so a one-off network hiccup no longer takes the app down.
+def _is_transient_db_error(exc):
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "network error", "connection", "closed", "reset", "broken pipe",
+        "timeout", "eof", "server closed", "could not receive data",
+    ))
+
 def _qmark_to_named(sql, params):
     """Converts sqlite-style '?' placeholders + a positional params list into
     SQLAlchemy named-bind SQL + a params dict, so old call-sites work as-is."""
@@ -68,7 +85,22 @@ class _CompatConn:
         self._conn = sa_conn
     def execute(self, sql, params=None):
         named_sql, pdict = _qmark_to_named(sql, params or [])
-        return self._conn.execute(text(named_sql), pdict)
+        try:
+            return self._conn.execute(text(named_sql), pdict)
+        except (OperationalError, SAInterfaceError, DBAPIError) as e:
+            if not _is_transient_db_error(e):
+                raise
+            # Connection died mid-session (see _is_transient_db_error note
+            # above). Dispose the pool so no other stale connections get
+            # handed out either, open a fresh one, and retry this exact
+            # statement once before giving up.
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            _get_engine().dispose()
+            self._conn = _get_engine().connect()
+            return self._conn.execute(text(named_sql), pdict)
     def commit(self):
         self._conn.commit()
     def close(self):
@@ -756,15 +788,41 @@ EXPENSE_CATEGORIES = [
 # ─────────────────────────────────────────────
 def q(sql, params=None):
     named_sql, pdict = _qmark_to_named(sql, params or [])
-    engine = _get_engine()
-    with engine.connect() as conn:
-        df = pd.read_sql(text(named_sql), conn, params=pdict)
-    return df
+
+    def _run():
+        engine = _get_engine()
+        with engine.connect() as conn:
+            return pd.read_sql(text(named_sql), conn, params=pdict)
+
+    try:
+        return _run()
+    except (OperationalError, SAInterfaceError, DBAPIError) as e:
+        if not _is_transient_db_error(e):
+            raise
+        try:
+            _get_engine().dispose()
+        except Exception:
+            pass
+        return _run()
 
 def scalar(sql, params=None):
-    conn = get_conn()
-    r = conn.execute(sql, params or []).fetchone()
-    conn.close()
+    def _run():
+        conn = get_conn()
+        try:
+            return conn.execute(sql, params or []).fetchone()
+        finally:
+            conn.close()
+
+    try:
+        r = _run()
+    except (OperationalError, SAInterfaceError, DBAPIError) as e:
+        if not _is_transient_db_error(e):
+            raise
+        try:
+            _get_engine().dispose()
+        except Exception:
+            pass
+        r = _run()
     return (r[0] or 0) if r else 0
 
 @st.cache_data(ttl=20, show_spinner=False)
