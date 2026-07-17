@@ -14,7 +14,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
-from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import create_engine, text, inspect, event
 from sqlalchemy.exc import OperationalError, InterfaceError as SAInterfaceError, DBAPIError
 
 # ═══════════════════════════════════════════════
@@ -45,23 +45,22 @@ def _get_engine():
     # could hang. pg8000's socket has no default timeout, and Postgres has
     # no default statement_timeout — so if the network path to the DB is
     # degraded (not fully down, just slow/lossy), a connect or a query can
-    # sit there for minutes with zero ceiling. Worse, the retry-on-error
-    # logic added for the earlier "network error" crash then retries that
-    # same unbounded wait a second time. A single DC Entry fires ~15-20 DB
-    # calls (Step 1 auto-load, Step 2 live indicators, the save itself) —
-    # at 1-2 minutes of unbounded hang each, that alone accounts for a
-    # 20-minute save. These caps make every attempt fail FAST (single-digit
-    # seconds) instead of hanging, which is a strict improvement either way:
-    # if the network is fine, these never trigger; if it's degraded, you
-    # get a fast, clear error instead of a frozen page.
+    # sit there for minutes with zero ceiling. These caps make every attempt
+    # fail FAST (single-digit seconds) instead of hanging.
+    #
+    # BUGFIX (this crashed every single connection attempt): the first cut
+    # of this fix passed options="-c statement_timeout=..." in connect_args.
+    # That's a psycopg2-ism — pg8000's connect() has no "options" parameter
+    # at all, so EVERY connection attempt raised
+    #   TypeError: connect() got an unexpected keyword argument 'options'
+    # before it ever touched the network. Removed. The socket timeout below
+    # (which pg8000 does support) stays; statement_timeout is now set the
+    # driver-agnostic way, via an on-connect hook right after this function.
     connect_args = {}
     if db_url.startswith("postgresql+pg8000"):
-        connect_args = {
-            "timeout": 8,  # socket connect timeout, seconds
-            "options": "-c statement_timeout=15000",  # server-side query cap, ms
-        }
+        connect_args = {"timeout": 8}  # socket connect timeout, seconds
 
-    return create_engine(
+    engine = create_engine(
         db_url,
         pool_pre_ping=True,
         pool_size=5,
@@ -69,6 +68,20 @@ def _get_engine():
         pool_recycle=300,
         connect_args=connect_args,
     )
+
+    if db_url.startswith("postgresql+pg8000"):
+        @event.listens_for(engine, "connect")
+        def _set_statement_timeout(dbapi_conn, conn_record):
+            # Runs once per new physical connection (not per checkout), right
+            # after pg8000 connects — caps any single query at 15s server-side
+            # so a bad query can't hang a page indefinitely.
+            cur = dbapi_conn.cursor()
+            try:
+                cur.execute("SET statement_timeout = 15000")
+            finally:
+                cur.close()
+
+    return engine
 
 # RELIABILITY FIX: crash seen in production —
 #   pg8000.core.InterfaceError: network error
