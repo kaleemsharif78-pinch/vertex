@@ -1129,27 +1129,43 @@ def round_bal(val):
         return 0
 
 def build_article_blocks(df_ledger):
-    """BUGFIX: Master Ledger / PDF were showing only a flat GLOBAL sum per
-    category (e.g. total Inlay Cards across every article combined), which
-    hides which specific article still owes what. This groups by
-    [Article, Item Type] instead, and drops any category whose remaining
-    balance rounds to zero within that article — so each block only shows
-    what's actually still pending for that article.
-    Returns an ordered dict: {article: {item_type: remaining_balance, ...}}
+    """BUGFIX (data-merging, priority): this used to group by [Article, Item
+    Type] ONLY, ignoring Call-Off entirely — so the same Article Number
+    running under two different Call-Offs (e.g. 291 and 292) got summed
+    together into a single merged line. That's wrong: quantities must stay
+    strictly separated by Call-Off even when the Article Number repeats.
+    Now groups by [Call-Off No, Article, Item Type] instead, and returns an
+    ORDERED LIST of (call_off_no, article, {item_type: balance}) tuples —
+    not a dict keyed by article alone, since a dict can't hold two separate
+    entries for the same article number. Each Call-Off/Article combination
+    always renders as its own distinct block with its own individual
+    quantity, never merged with any other Call-Off's total for that article.
+    Also drops any category whose remaining balance rounds to zero within
+    that specific Call-Off+Article block, same as before.
     """
-    blocks = {}
+    blocks = []
     if df_ledger is None or df_ledger.empty:
         return blocks
-    grouped = df_ledger.groupby(["Article", "Item Type"])["Remaining Balance"].sum().reset_index()
-    for article in sorted(grouped["Article"].unique().tolist()):
-        sub = grouped[grouped["Article"] == article]
+    has_calloff = "Call-Off No" in df_ledger.columns
+    group_cols = ["Call-Off No", "Article", "Item Type"] if has_calloff else ["Article", "Item Type"]
+    grouped = df_ledger.groupby(group_cols)["Remaining Balance"].sum().reset_index()
+    key_cols = ["Call-Off No", "Article"] if has_calloff else ["Article"]
+    keys = grouped[key_cols].drop_duplicates().sort_values(key_cols).values.tolist()
+    for key_vals in keys:
+        if has_calloff:
+            coff, article = key_vals
+            sub = grouped[(grouped["Call-Off No"] == coff) & (grouped["Article"] == article)]
+        else:
+            article = key_vals[0]
+            coff = None
+            sub = grouped[grouped["Article"] == article]
         cats = {}
         for _, r in sub.iterrows():
             bal = round_bal(r["Remaining Balance"])
             if bal != 0:
                 cats[r["Item Type"]] = bal
         if cats:
-            blocks[article] = cats
+            blocks.append((coff, article, cats))
     return blocks
 
 # ─────────────────────────────────────────────
@@ -1214,10 +1230,11 @@ def generate_ledger_pdf(df_summary, df_articles, sel_coff, sel_cont, sel_art, re
                                            textColor=colors.white, fontName='Helvetica-Bold')
         NCOLS = 3
         block_cells = []
-        for article, cats in article_blocks.items():
+        for coff, article, cats in article_blocks:
             lines = "<br/>".join(f"📦 {cat}: <b>{bal:,}</b> Pcs" for cat, bal in cats.items())
+            header_txt = f"🎯 Article: {article}" + (f" &nbsp;|&nbsp; Call-Off: {coff}" if coff else "")
             mini = Table(
-                [[Paragraph(f"🎯 Article: {article}", block_head_style)],
+                [[Paragraph(header_txt, block_head_style)],
                  [Paragraph(lines, block_cell_style)]],
                 colWidths=[158]
             )
@@ -2629,15 +2646,16 @@ with tab4:
                 n_articles = len(article_blocks)
                 n_cols = 3 if n_articles >= 3 else (2 if n_articles == 2 else 1)
                 art_block_cols = st.columns(n_cols)
-                for idx, (article, cats) in enumerate(article_blocks.items()):
+                for idx, (coff, article, cats) in enumerate(article_blocks):
                     cat_lines = "".join(
                         f'<div style="font-size:12px; margin-top:2px;">📦 {cat}: <b>{bal:,}</b> Pcs</div>'
                         for cat, bal in cats.items()
                     )
+                    coff_txt = f' <span style="opacity:.8; font-weight:400;">| Call-Off: {coff}</span>' if coff else ""
                     with art_block_cols[idx % n_cols]:
                         st.markdown(f'''
                         <div class="kpi kb" style="text-align:left; margin-bottom:8px; padding:10px; border-radius:6px;">
-                            <span style="font-size:13px; font-weight:700;">🎯 Article: {article}</span>
+                            <span style="font-size:13px; font-weight:700;">🎯 Article: {article}{coff_txt}</span>
                             {cat_lines}
                         </div>
                         ''', unsafe_allow_html=True)
