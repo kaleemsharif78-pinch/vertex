@@ -2156,6 +2156,16 @@ with tab2:
                         "Item Description (as per PO)",
                         key="dc_desc",
                         placeholder="e.g. SAFETY STICKER TRANSPARENT (5X1.5 CM) - BH")
+                    # HOTFIX: Combo Article detection — one article number
+                    # carrying multiple distinct qualities (e.g. "MOLTEN+LYCRA"),
+                    # each needing its own separate Inlay Card / Tag Card entry
+                    # under that same article. Detected from a "+" in the typed
+                    # description — how these are written on the source PO/DC
+                    # sheets — and "clearly highlighted" per spec so it's obvious
+                    # this entry is being treated as a combo before you save.
+                    is_combo_article = "+" in str(f_desc).upper()
+                    if is_combo_article:
+                        st.caption("🔗 Combo Article detected (combined quality) — over-access check relaxed for this entry.")
                     f_qty = st.number_input("Quantity (Pcs) *", min_value=0.0, step=1.0, format="%g", key="dc_qty")
                     f_qty_jersey = f_qty_molton = 0.0
                     f_desc_jersey = f_desc_molton = ""
@@ -2167,39 +2177,50 @@ with tab2:
         with dc_main_cols[1]:
             st.markdown("<h5>🎯 Live Contract Status Counter</h5>", unsafe_allow_html=True)
             max_allowed = 0
-        
-            counter_cols = st.columns(2)
-        
-            if f_coff and f_contract:
-                # PERFORMANCE FIX: cached (see get_category_totals_for_contract) —
-                # was 2 fresh grouped round-trips on every single rerun.
-                ord_map, rec_map = get_category_totals_for_contract(f_coff, f_contract)
 
-                for idx, item in enumerate(ITEM_TYPES):
-                    o_q = ord_map.get(item, 0) or 0
-                    r_q = rec_map.get(item, 0) or 0
-                
-                    rounded_oq = int(math.floor(o_q + 0.5))
-                    rounded_rq = int(math.floor(r_q + 0.5))
-                    r_q_rem = rounded_oq - rounded_rq
-                
-                    if item == f_type:
-                        # PERFORMANCE FIX: cached helpers instead of 2 fresh
-                        # round-trips on every rerun.
-                        max_allowed = get_ordered_for_article_contract(f_coff, f_contract, item, f_art) - get_received_for_article_contract(f_coff, f_contract, item, f_art)
-                
-                    b_cls = "kb" if r_q_rem > 0 else "kr"
-                
-                    with counter_cols[idx % 2]:
-                        st.markdown(f"""
-                        <div class="kpi {b_cls}" style="margin-bottom: 8px; padding: 10px; border-radius: 6px; text-align: left; box-shadow: 0 2px 4px rgba(0,0,0,0.3);">
-                            <span style="font-size: 12px; font-weight: 700; display: block; color: #ffffff !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 3px;">📦 {item}</span>
-                            <div style="font-size: 11px; color: #cbd5e1 !important; line-height: 1.3;">
-                              Ord: <b style="color: #ffffff !important;">{rounded_oq:,}</b> | Rec: <b style="color: #ffffff !important;">{rounded_rq:,}</b><br>
-                              <span style="font-size: 12px; font-weight: 700; color: #ffffff !important;">⏳ Rem: {r_q_rem:,} Pcs</span>
+            # HOTFIX: this panel used to auto-compute and re-render on every
+            # single rerun (every keystroke anywhere in the form), which was
+            # freezing the screen during DC Entry. It's now manual — the
+            # numbers only get calculated and shown when the button below is
+            # clicked. NOTE: max_allowed itself is still computed directly
+            # here every run (it's a single cached lookup, not the full
+            # per-category loop) so the Save button's over-delivery
+            # validation further down keeps working exactly as before,
+            # whether or not you've clicked "Check Contract Status".
+            if f_coff and f_contract:
+                max_allowed = get_ordered_for_article_contract(f_coff, f_contract, f_type, f_art) - get_received_for_article_contract(f_coff, f_contract, f_type, f_art)
+
+            if st.button("🔍 Check Contract Status", key="dc_check_status"):
+                if f_coff and f_contract:
+                    # PERFORMANCE FIX: cached (see get_category_totals_for_contract) —
+                    # was 2 fresh grouped round-trips on every single rerun.
+                    ord_map, rec_map = get_category_totals_for_contract(f_coff, f_contract)
+
+                    counter_cols = st.columns(2)
+                    for idx, item in enumerate(ITEM_TYPES):
+                        o_q = ord_map.get(item, 0) or 0
+                        r_q = rec_map.get(item, 0) or 0
+
+                        rounded_oq = int(math.floor(o_q + 0.5))
+                        rounded_rq = int(math.floor(r_q + 0.5))
+                        r_q_rem = rounded_oq - rounded_rq
+
+                        b_cls = "kb" if r_q_rem > 0 else "kr"
+
+                        with counter_cols[idx % 2]:
+                            st.markdown(f"""
+                            <div class="kpi {b_cls}" style="margin-bottom: 8px; padding: 10px; border-radius: 6px; text-align: left; box-shadow: 0 2px 4px rgba(0,0,0,0.3);">
+                                <span style="font-size: 12px; font-weight: 700; display: block; color: #ffffff !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 3px;">📦 {item}</span>
+                                <div style="font-size: 11px; color: #cbd5e1 !important; line-height: 1.3;">
+                                  Ord: <b style="color: #ffffff !important;">{rounded_oq:,}</b> | Rec: <b style="color: #ffffff !important;">{rounded_rq:,}</b><br>
+                                  <span style="font-size: 12px; font-weight: 700; color: #ffffff !important;">⏳ Rem: {r_q_rem:,} Pcs</span>
+                                </div>
                             </div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                            """, unsafe_allow_html=True)
+                else:
+                    st.info("Select a Call-Off and Contract in Step 1 first.")
+            else:
+                st.caption("Click the button above to load the live Ordered / Received / Remaining breakdown for this contract.")
 
         if f_art and f_type:
             o_qty = get_ordered_qty(f_art, f_type, coff=f_coff or None, po=f_po or None)
@@ -2281,7 +2302,7 @@ with tab2:
         
             if not s_dc or not s_po or not s_coff or f_qty <= 0 or not s_art:
                 st.error("⚠️ DC No., Call-Off, PO, Article and Quantity are required.")
-            elif int(f_qty) > rounded_max_allowed and max_allowed >= 0:
+            elif int(f_qty) > rounded_max_allowed and max_allowed >= 0 and not is_combo_article:
                 st.error(f"🚨 ALERT! Over-delivery blocked. Max remaining allowed for {f_type} is exactly {rounded_max_allowed:,} Pcs. You cannot enter {int(f_qty):,} Pcs.")
             else:
                 conn = get_conn()
