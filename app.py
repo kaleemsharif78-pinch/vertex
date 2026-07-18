@@ -1054,15 +1054,49 @@ def get_cached_item_description(article, category):
     df = q("SELECT description FROM item_desc_cache WHERE article=? AND category=? ORDER BY id DESC LIMIT 1", [article, category])
     return df.iloc[0]["description"] if not df.empty else ""
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_cached_item_descriptions_list(article, category):
+    """NEW ADDITION: returns ALL distinct descriptions ever saved for this
+    Article+Category (most recent first, capped at 5) — not just the last
+    one. This is what powers the Combo Article description dropdown: a
+    combo article carries two DIFFERENT quality descriptions (e.g. one
+    'MOLTEN+LYCRA' Inlay Card line and one plain 'MOLTEN' Inlay Card line)
+    under the same article+category, and the old single-slot cache used to
+    overwrite one with the other every time you saved."""
+    if not article or not category:
+        return []
+    df = q("SELECT description FROM item_desc_cache WHERE article=? AND category=? ORDER BY id DESC LIMIT 5", [article, category])
+    return df["description"].tolist()
+
 def save_cached_item_description(article, category, description):
     if not article or not category or not str(description).strip():
         return
+    desc = description.strip()
     conn = get_conn()
-    conn.execute("DELETE FROM item_desc_cache WHERE article=? AND category=?", (article, category))
-    conn.execute("INSERT INTO item_desc_cache (article, category, description) VALUES (?,?,?)", (article, category, description.strip()))
-    conn.commit()
+    # BUGFIX: this used to DELETE the existing row before inserting the new
+    # one — a single-slot "last description wins" cache. For a Combo
+    # Article that means saving quality #2's description would silently
+    # erase quality #1's remembered wording. Now it keeps a short history
+    # instead (skip the insert if this exact wording is already saved;
+    # otherwise add it and trim to the 5 most recent per article+category).
+    existing = conn.execute(
+        "SELECT id FROM item_desc_cache WHERE article=? AND category=? AND description=?",
+        (article, category, desc)
+    ).fetchone()
+    if not existing:
+        conn.execute("INSERT INTO item_desc_cache (article, category, description) VALUES (?,?,?)", (article, category, desc))
+        conn.commit()
+        conn.execute("""
+            DELETE FROM item_desc_cache WHERE article=? AND category=? AND id NOT IN (
+                SELECT id FROM (
+                    SELECT id FROM item_desc_cache WHERE article=? AND category=? ORDER BY id DESC LIMIT 5
+                ) AS keep_ids
+            )
+        """, (article, category, article, category))
+        conn.commit()
     conn.close()
     get_cached_item_description.clear()
+    get_cached_item_descriptions_list.clear()
 
 def autofill_item_description(widget_key, source_key, article, category):
     """Refresh a description field only when its selected item changes."""
@@ -2152,6 +2186,25 @@ with tab2:
                     f_qty = 0.0  # existing single-flow field unused in dual-pack mode
                 else:
                     autofill_item_description("dc_desc", "dc_desc_source", f_art, f_type)
+
+                    # NEW ADDITION: Combo Article quality picker. Once TWO or
+                    # more distinct descriptions have ever been saved for this
+                    # exact Article+Item Type (e.g. one "...MOLTEN+LYCRA" line
+                    # and one plain "...MOLTEN" line), they're offered here as
+                    # a dropdown instead of forcing a retype/copy-paste. Pick
+                    # one to reuse it verbatim, or pick "Type New" to enter a
+                    # third variant — either way it still saves into the same
+                    # history for next time.
+                    past_descs = get_cached_item_descriptions_list(f_art, f_type) if f_art else []
+                    NEW_DESC_OPTION = "✏️ Type New / Custom Description"
+                    if len(past_descs) >= 2:
+                        picker_choice = st.selectbox(
+                            "🔗 Combo Article — Select Quality / Description",
+                            past_descs + [NEW_DESC_OPTION],
+                            key="dc_desc_picker")
+                        if picker_choice != NEW_DESC_OPTION:
+                            st.session_state["dc_desc"] = picker_choice
+
                     f_desc = st.text_input(
                         "Item Description (as per PO)",
                         key="dc_desc",
@@ -2175,52 +2228,20 @@ with tab2:
                 f_destination = st.text_input("Destination", key="dc_destination", placeholder="e.g. SOHRAB/HSU")
 
         with dc_main_cols[1]:
-            st.markdown("<h5>🎯 Live Contract Status Counter</h5>", unsafe_allow_html=True)
+            # HOTFIX (per client decision): the Live Contract Status Counter
+            # panel — heading, grid, and the "Check Contract Status" button —
+            # has been removed entirely, not just hidden behind a click.
+            #
+            # max_allowed is still computed here, silently, with NO UI: the
+            # Save button's over-delivery validation further down depends on
+            # it, and removing it would silently disable that safety check.
+            # This is a single cached lookup (get_ordered_for_article_contract
+            # / get_received_for_article_contract), not the 7-category grid
+            # that was actually causing the lag — so keeping it does not
+            # reintroduce any of the slowness that was removed.
             max_allowed = 0
-
-            # HOTFIX: this panel used to auto-compute and re-render on every
-            # single rerun (every keystroke anywhere in the form), which was
-            # freezing the screen during DC Entry. It's now manual — the
-            # numbers only get calculated and shown when the button below is
-            # clicked. NOTE: max_allowed itself is still computed directly
-            # here every run (it's a single cached lookup, not the full
-            # per-category loop) so the Save button's over-delivery
-            # validation further down keeps working exactly as before,
-            # whether or not you've clicked "Check Contract Status".
             if f_coff and f_contract:
                 max_allowed = get_ordered_for_article_contract(f_coff, f_contract, f_type, f_art) - get_received_for_article_contract(f_coff, f_contract, f_type, f_art)
-
-            if st.button("🔍 Check Contract Status", key="dc_check_status"):
-                if f_coff and f_contract:
-                    # PERFORMANCE FIX: cached (see get_category_totals_for_contract) —
-                    # was 2 fresh grouped round-trips on every single rerun.
-                    ord_map, rec_map = get_category_totals_for_contract(f_coff, f_contract)
-
-                    counter_cols = st.columns(2)
-                    for idx, item in enumerate(ITEM_TYPES):
-                        o_q = ord_map.get(item, 0) or 0
-                        r_q = rec_map.get(item, 0) or 0
-
-                        rounded_oq = int(math.floor(o_q + 0.5))
-                        rounded_rq = int(math.floor(r_q + 0.5))
-                        r_q_rem = rounded_oq - rounded_rq
-
-                        b_cls = "kb" if r_q_rem > 0 else "kr"
-
-                        with counter_cols[idx % 2]:
-                            st.markdown(f"""
-                            <div class="kpi {b_cls}" style="margin-bottom: 8px; padding: 10px; border-radius: 6px; text-align: left; box-shadow: 0 2px 4px rgba(0,0,0,0.3);">
-                                <span style="font-size: 12px; font-weight: 700; display: block; color: #ffffff !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 3px;">📦 {item}</span>
-                                <div style="font-size: 11px; color: #cbd5e1 !important; line-height: 1.3;">
-                                  Ord: <b style="color: #ffffff !important;">{rounded_oq:,}</b> | Rec: <b style="color: #ffffff !important;">{rounded_rq:,}</b><br>
-                                  <span style="font-size: 12px; font-weight: 700; color: #ffffff !important;">⏳ Rem: {r_q_rem:,} Pcs</span>
-                                </div>
-                            </div>
-                            """, unsafe_allow_html=True)
-                else:
-                    st.info("Select a Call-Off and Contract in Step 1 first.")
-            else:
-                st.caption("Click the button above to load the live Ordered / Received / Remaining breakdown for this contract.")
 
         if f_art and f_type:
             o_qty = get_ordered_qty(f_art, f_type, coff=f_coff or None, po=f_po or None)
