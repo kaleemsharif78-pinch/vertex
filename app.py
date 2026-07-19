@@ -1639,15 +1639,40 @@ def render_ditto_dc_section(key_prefix, default_dc=None):
     if ditto_dc_sel == "-- Select --":
         return
 
-    df_dc_lines = q("""
+    df_dc_lines_raw = q("""
         SELECT call_off_no, contract_no, po_no, article, category, qty, entry_date, remark,
                item_description, company_token, destination, style_type, company_type
         FROM inventory WHERE dc_no=? ORDER BY id
     """, [ditto_dc_sel])
 
-    if df_dc_lines.empty:
+    if df_dc_lines_raw.empty:
         st.info("No line items found for this DC.")
         return
+
+    # BUGFIX (priority — cross-Call-Off data merging on the single-DC
+    # printout): "DC No." is a free-typed text field, NOT validated unique
+    # per Call-Off. If the same DC No. was ever saved under two different
+    # Call-Offs (typo or reused DC No.), the query above — which only
+    # filtered on dc_no — pulled BOTH Call-Offs' lines into one printout,
+    # even though the header only ever displayed one Call-Off number. That
+    # is exactly what produced the mixed Article-Wise Summary reported.
+    # Fix: determine the dominant (most common) Call-Off for this DC No.,
+    # then strictly filter every line — main table AND Article-Wise
+    # Summary — to that Call-Off only. Anything else is excluded and
+    # flagged below instead of silently blending in.
+    coff_series = df_dc_lines_raw["call_off_no"].astype(str).str.strip()
+    dc_calloff = coff_series.mode().iloc[0]
+    df_dc_lines = df_dc_lines_raw[coff_series == dc_calloff].reset_index(drop=True)
+    _stray_rows = df_dc_lines_raw[coff_series != dc_calloff]
+    if not _stray_rows.empty:
+        _other_coffs = sorted(_stray_rows["call_off_no"].astype(str).str.strip().unique().tolist())
+        st.warning(
+            f"⚠️ DC No. **{ditto_dc_sel}** is also saved under a different Call-Off "
+            f"({', '.join(_other_coffs)}) in the database. This printout is strictly "
+            f"limited to Call-Off **{dc_calloff}** — those other lines are excluded, "
+            f"not merged in. This usually means the DC No. was accidentally reused; "
+            f"consider correcting the DC No. on the other Call-Off's entries."
+        )
 
     hdr = df_dc_lines.iloc[0]
     dc_token = hdr["company_token"] if str(hdr["company_token"]).strip() else ""
@@ -2523,6 +2548,51 @@ with tab3:
                             if cn.button("❌ No", key=f"cn_{row['id']}"):
                                 st.session_state.pop(f"cdel_{row['id']}", None)
                                 st.rerun()
+
+            st.markdown("---")
+            st.markdown("### 🗑️ Bulk Delete — Entire DC")
+            st.caption("Deletes every line item saved under one DC No. in a single action — for correcting a DC that needs to be fully redone, instead of deleting each line one by one above.")
+            bd_c1, bd_c2 = st.columns([3, 2])
+            with bd_c1:
+                bulk_del_dc = st.text_input("Enter DC Number for Full Deletion", key="bulk_del_dc_input", placeholder="e.g. 4753")
+            with bd_c2:
+                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                bulk_del_clicked = st.button("🗑️ Delete Entire DC", key="bulk_del_dc_btn", type="primary")
+
+            if bulk_del_clicked:
+                dc_to_delete = bulk_del_dc.strip()
+                if not dc_to_delete:
+                    st.error("⚠️ Please enter a DC Number first.")
+                else:
+                    _bd_count = scalar("SELECT COUNT(*) FROM inventory WHERE dc_no=?", [dc_to_delete])
+                    if _bd_count == 0:
+                        st.error(f"⚠️ No entries found for DC No. **{dc_to_delete}**.")
+                    else:
+                        st.session_state["bulk_del_pending_dc"] = dc_to_delete
+                        st.session_state["bulk_del_pending_count"] = _bd_count
+
+            # Safety confirmation popup — nothing is deleted until this is
+            # explicitly confirmed.
+            if st.session_state.get("bulk_del_pending_dc"):
+                _pdc = st.session_state["bulk_del_pending_dc"]
+                _pct = st.session_state["bulk_del_pending_count"]
+                st.warning(f"⚠️ This will permanently delete **{_pct}** line item(s) under DC No. **{_pdc}**. This cannot be undone. Are you sure?")
+                bd_cy, bd_cn, _ = st.columns([1.5, 1.5, 5])
+                with bd_cy:
+                    if st.button("✅ Yes, Delete Entire DC", key="bulk_del_confirm_yes", type="primary"):
+                        conn = get_conn()
+                        conn.execute("DELETE FROM inventory WHERE dc_no=?", (_pdc,))
+                        conn.commit(); conn.close()
+                        st.session_state.pop("bulk_del_pending_dc", None)
+                        st.session_state.pop("bulk_del_pending_count", None)
+                        st.session_state["inline_edit_id"] = None
+                        st.success(f"✅ Deleted all {_pct} line item(s) under DC No. {_pdc}.")
+                        st.rerun()
+                with bd_cn:
+                    if st.button("❌ Cancel", key="bulk_del_confirm_no"):
+                        st.session_state.pop("bulk_del_pending_dc", None)
+                        st.session_state.pop("bulk_del_pending_count", None)
+                        st.rerun()
 
             st.markdown("---")
             st.markdown("### ⚠️ Total System Reset")
