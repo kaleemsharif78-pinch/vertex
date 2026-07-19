@@ -2594,17 +2594,12 @@ with tab3:
                         st.session_state.pop("bulk_del_pending_count", None)
                         st.rerun()
 
-            st.markdown("---")
-            st.markdown("### ⚠️ Total System Reset")
-            if st.checkbox("Yes, I want to delete EVERYTHING", key="confirm_reset"):
-                if st.button("🚨 FULL SOFTWARE RESET", type="primary", key="btn_reset"):
-                    conn = get_conn()
-                    conn.execute("DELETE FROM inventory")
-                    conn.execute("DELETE FROM sheet_orders")
-                    conn.commit(); conn.close()
-                    st.session_state["inline_edit_id"] = None
-                    st.success("System reset complete!")
-                    st.rerun()
+            # SECURITY UPDATE: "Total System Reset" used to sit here, in the
+            # open, on a tab visible to Admin/Data Entry/CEO — a single
+            # misclick risked wiping the whole database. Moved to
+            # 👤 User Management (Admin-only tab access), inside a
+            # collapsed "Danger Zone" expander, so it's no longer sitting
+            # in plain view during everyday DC work.
 
             st.markdown("---")
             st.markdown('<div class="sec">🖨️ NEW: Generate Ditto DC</div>', unsafe_allow_html=True)
@@ -3481,6 +3476,28 @@ with tab7:
                         st.rerun()
         else:
             st.caption("No other users to delete.")
+
+        # SECURITY UPDATE: "Total System Reset" moved here from the All
+        # Entries tab, where it used to sit in the open and risked an
+        # accidental click wiping the whole database. This tab is already
+        # Admin-only (see TAB_ACCESS), and it's now additionally tucked
+        # inside a collapsed "Danger Zone" expander at the very bottom, so
+        # it's never visible during normal day-to-day use.
+        st.markdown("---")
+        with st.expander("☠️ Danger Zone — Total System Reset", expanded=False):
+            st.error("This permanently deletes EVERY DC entry and EVERY sheet order in the entire system. This cannot be undone.")
+            reset_confirm_text = st.text_input(
+                "Type RESET (all caps) to enable the button below", key="reset_confirm_text")
+            reset_enabled = reset_confirm_text.strip() == "RESET"
+            if st.button("🚨 FULL SOFTWARE RESET", type="primary", key="btn_reset", disabled=not reset_enabled):
+                conn = get_conn()
+                conn.execute("DELETE FROM inventory")
+                conn.execute("DELETE FROM sheet_orders")
+                conn.commit(); conn.close()
+                st.session_state["inline_edit_id"] = None
+                st.session_state["reset_confirm_text"] = ""
+                st.success("System reset complete!")
+                st.rerun()
 
 # ═══════════════════════════════════════════════
 # TAB 8 — 🆕 DAILY EXPENSES / STAFF EXPENSE
